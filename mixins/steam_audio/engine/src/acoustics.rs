@@ -1,16 +1,12 @@
 //! World acoustics for the Horizon renderer: how each source reaches the listener through the blocks between them
-//! (occlusion and transmission), and how reverberant the listener's surroundings are.
+//! (occlusion and transmission). The reverb of the surroundings is simulated in [`crate::reflections`].
 //!
-//! Both come from rays through the block grid, cast on the game thread (the world lives there):
-//!
-//! - **Occlusion** follows Steam Audio's volumetric occlusion: rays from the listener to the source and to points
-//!   around it; the fraction that gets through unobstructed is the occlusion value. **Transmission** follows Steam
-//!   Audio's frequency-dependent transmission: along the central ray, every blocking cell multiplies each band by
-//!   its material's transmission coefficient. The direct path's band gains are then Steam Audio's
-//!   `occlusion + (1 - occlusion) · transmission` (`DirectEffect`).
-//! - **Reverb**: rays in every direction from the listener measure how enclosed the place is, how far the walls
-//!   are and what they are made of. Sabine's formula turns that into a reverb time per band for Steam Audio's
-//!   parametric [`ReverbEffect`](crate::effects::ReverbEffect); open places get little reverb.
+//! Rays through the block grid, cast on the game thread (the world lives there): **occlusion** follows Steam Audio's
+//! volumetric occlusion: rays from the listener to the source and to points around it; the fraction that gets
+//! through unobstructed is the occlusion value. **Transmission** follows Steam Audio's frequency-dependent
+//! transmission: along the central ray, every blocking cell multiplies each band by its material's transmission
+//! coefficient. The direct path's band gains are then Steam Audio's `occlusion + (1 - occlusion) · transmission`
+//! (`DirectEffect`).
 //!
 //! A full cube of collision is a wall; everything else (slabs, fences, leaves, fluids) lets sound through. A wall's
 //! material is one of Steam Audio's presets, chosen from the block's sound type.
@@ -194,35 +190,6 @@ impl SourceAcoustics {
     }
 }
 
-/// The listener's surroundings as a parametric reverb.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct EnvironmentReverb {
-    /// Time for the energy to decay by 60 dB, per band, in seconds.
-    pub reverb_times: [f32; NUM_BANDS],
-    /// Level of the reverb relative to what sources send it (0: dry).
-    pub wet: f32,
-}
-
-impl EnvironmentReverb {
-    /// No reverb.
-    pub const DRY: Self = Self {
-        reverb_times: [MIN_REVERB_TIME; NUM_BANDS],
-        wet: 0.0,
-    };
-
-    fn approach(&mut self, target: &Self, rate: f32) {
-        self.wet += (target.wet - self.wet) * rate;
-        for (t, &goal) in self.reverb_times.iter_mut().zip(&target.reverb_times) {
-            *t += (goal - *t) * rate;
-        }
-    }
-}
-
-/// Steam Audio's shortest reverb time.
-pub const MIN_REVERB_TIME: f32 = 0.1;
-/// The longest reverb time the probe reports.
-pub const MAX_REVERB_TIME: f32 = 8.0;
-
 /// Tuning of the world acoustics.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AcousticsSettings {
@@ -233,11 +200,6 @@ pub struct AcousticsSettings {
     pub max_walls: u32,
     /// Distance from a source of the points the occlusion rays aim at besides its centre, in blocks.
     pub source_radius: f64,
-    /// Rays the reverb probe casts, and how far.
-    pub reverb_rays: usize,
-    pub reverb_range: f64,
-    /// Reverb level in a fully enclosed place.
-    pub reverb_level: f32,
 }
 
 impl Default for AcousticsSettings {
@@ -246,9 +208,6 @@ impl Default for AcousticsSettings {
             transmission_exponent: 0.35,
             max_walls: 8,
             source_radius: 0.6,
-            reverb_rays: 48,
-            reverb_range: 40.0,
-            reverb_level: 0.5,
         }
     }
 }
@@ -365,70 +324,9 @@ pub fn source_acoustics(
     }
 }
 
-/// The reverb of the place around `listener`.
-pub fn environment_reverb(
-    wall: &mut impl FnMut([i32; 3]) -> Option<Surface>,
-    listener: [f64; 3],
-    settings: &AcousticsSettings,
-) -> EnvironmentReverb {
-    let rays = settings.reverb_rays.max(1);
-    let (mut hits, mut distance) = (0usize, 0.0f64);
-    // Rays going up, and how many of them meet a ceiling: under the open sky there is little reverb.
-    let (mut up, mut up_hits) = (0usize, 0usize);
-    let mut absorption = [0.0f32; NUM_BANDS];
-    // Directions spread evenly over the sphere (a Fibonacci lattice).
-    let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
-    for i in 0..rays {
-        let y = 1.0 - 2.0 * (i as f64 + 0.5) / rays as f64;
-        let radius = (1.0 - y * y).sqrt();
-        let theta = golden * i as f64;
-        let dir = [radius * theta.cos(), y, radius * theta.sin()];
-        let to = [
-            listener[0] + dir[0] * settings.reverb_range,
-            listener[1] + dir[1] * settings.reverb_range,
-            listener[2] + dir[2] * settings.reverb_range,
-        ];
-        let upward = y > 0.0;
-        up += usize::from(upward);
-        cells_between(listener, to, |c, t| match wall(c) {
-            Some(surface) => {
-                hits += 1;
-                up_hits += usize::from(upward);
-                distance += t.max(0.5);
-                for (a, &m) in absorption.iter_mut().zip(&surface.material().absorption) {
-                    *a += m;
-                }
-                false
-            }
-            None => true,
-        });
-    }
-    if hits == 0 {
-        return EnvironmentReverb::DRY;
-    }
-    let enclosed = hits as f32 / rays as f32;
-    let mean_distance = (distance / hits as f64) as f32;
-    // Sabine: T = 0.161 V / (S α). Seen from inside, V / S of a room is about a third of the distance to its walls
-    // (a sphere's); what escapes to the open counts as fully absorbed.
-    let reverb_times = absorption.map(|a| {
-        let alpha = enclosed * (a / hits as f32) + (1.0 - enclosed);
-        (0.161 * mean_distance / 3.0 / alpha.max(0.01)).clamp(MIN_REVERB_TIME, MAX_REVERB_TIME)
-    });
-    let covered = if up == 0 {
-        1.0
-    } else {
-        up_hits as f32 / up as f32
-    };
-    EnvironmentReverb {
-        reverb_times,
-        wet: settings.reverb_level * enclosed * covered,
-    }
-}
-
 #[derive(Debug)]
 struct Shared {
     sources: HashMap<u64, SourceAcoustics>,
-    reverb: EnvironmentReverb,
     /// Bumped on each publish.
     version: u64,
 }
@@ -436,7 +334,6 @@ struct Shared {
 static SHARED: LazyLock<Mutex<Shared>> = LazyLock::new(|| {
     Mutex::new(Shared {
         sources: HashMap::new(),
-        reverb: EnvironmentReverb::DRY,
         version: 0,
     })
 });
@@ -445,9 +342,8 @@ static SHARED: LazyLock<Mutex<Shared>> = LazyLock::new(|| {
 /// when the camera passes a corner.
 const SMOOTHING: f32 = 0.5;
 
-/// Publishes the game thread's latest results: the sources' (by mixer channel id; others are forgotten) and the
-/// listener's reverb (`None`: keep the last).
-pub fn publish(sources: &[(u64, SourceAcoustics)], reverb: Option<EnvironmentReverb>) {
+/// Publishes the game thread's latest results: the sources' (by mixer channel id; others are forgotten).
+pub fn publish(sources: &[(u64, SourceAcoustics)]) {
     let Ok(mut shared) = SHARED.lock() else {
         return;
     };
@@ -457,11 +353,6 @@ pub fn publish(sources: &[(u64, SourceAcoustics)], reverb: Option<EnvironmentRev
         value.approach(target, SMOOTHING);
         shared.sources.insert(*id, value);
     }
-    if let Some(target) = reverb {
-        let mut value = shared.reverb;
-        value.approach(&target, SMOOTHING);
-        shared.reverb = value;
-    }
     shared.version += 1;
 }
 
@@ -469,7 +360,6 @@ pub fn publish(sources: &[(u64, SourceAcoustics)], reverb: Option<EnvironmentRev
 pub fn clear() {
     if let Ok(mut shared) = SHARED.lock() {
         shared.sources.clear();
-        shared.reverb = EnvironmentReverb::DRY;
         shared.version += 1;
     }
 }
@@ -478,7 +368,6 @@ pub fn clear() {
 #[derive(Debug)]
 pub struct Snapshot {
     pub sources: HashMap<u64, SourceAcoustics>,
-    pub reverb: EnvironmentReverb,
     version: u64,
     /// Set by [`Snapshot::fixed`]: ignores what is published.
     fixed: bool,
@@ -488,7 +377,6 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self {
             sources: HashMap::new(),
-            reverb: EnvironmentReverb::DRY,
             version: u64::MAX,
             fixed: false,
         }
@@ -497,10 +385,9 @@ impl Default for Snapshot {
 
 impl Snapshot {
     /// Acoustics that stay as given (tests, tools).
-    pub fn fixed(sources: HashMap<u64, SourceAcoustics>, reverb: EnvironmentReverb) -> Self {
+    pub fn fixed(sources: HashMap<u64, SourceAcoustics>) -> Self {
         Self {
             sources,
-            reverb,
             version: u64::MAX,
             fixed: true,
         }
@@ -519,7 +406,6 @@ impl Snapshot {
         }
         self.version = shared.version;
         self.sources.clone_from(&shared.sources);
-        self.reverb = shared.reverb;
     }
 
     /// The direct path's band gains for source `id` (open when unknown).
@@ -592,32 +478,6 @@ mod tests {
         assert!(
             partial.occlusion > 0.0 && partial.occlusion < 1.0,
             "{partial:?}"
-        );
-    }
-
-    #[test]
-    fn caves_reverberate_and_fields_stay_dry() {
-        let settings = AcousticsSettings::default();
-        let field = environment_reverb(&mut world(|c| c[1] < 64), [0.5, 65.6, 0.5], &settings);
-        // A 9 x 5 x 9 stone room around the listener.
-        let mut cave = world(|c| c[0].abs() > 4 || c[2].abs() > 4 || c[1] < 62 || c[1] > 66);
-        let room = environment_reverb(&mut cave, [0.5, 63.6, 0.5], &settings);
-        let mut hall = world(|c| c[0].abs() > 16 || c[2].abs() > 16 || c[1] < 50 || c[1] > 80);
-        let large = environment_reverb(&mut hall, [0.5, 63.6, 0.5], &settings);
-        assert!(field.wet < 0.2 * room.wet, "{field:?} {room:?}");
-        assert!(room.wet > 0.4, "{room:?}");
-        assert!(
-            room.reverb_times[1] > 0.3 && room.reverb_times[1] < 2.0,
-            "{room:?}"
-        );
-        assert!(
-            large.reverb_times[1] > 2.0 * room.reverb_times[1],
-            "{large:?}"
-        );
-        assert!(field.reverb_times[1] < room.reverb_times[1]);
-        assert_eq!(
-            environment_reverb(&mut world(|_| false), [0.5, 64.0, 0.5], &settings),
-            EnvironmentReverb::DRY
         );
     }
 
@@ -701,8 +561,8 @@ mod tests {
             occlusion: 0.0,
             transmission: [0.2, 0.1, 0.05],
         };
-        publish(&[(42, SourceAcoustics::OPEN)], None);
-        publish(&[(42, walled)], None);
+        publish(&[(42, SourceAcoustics::OPEN)]);
+        publish(&[(42, walled)]);
         let mut snapshot = Snapshot::default();
         snapshot.update();
         let halfway = snapshot.sources[&42];
@@ -711,7 +571,7 @@ mod tests {
             "{halfway:?}"
         );
         assert_eq!(snapshot.direct_gains(7), [1.0; NUM_BANDS]);
-        publish(&[], None);
+        publish(&[]);
         snapshot.update();
         assert!(snapshot.sources.is_empty());
     }

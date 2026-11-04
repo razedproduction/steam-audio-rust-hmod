@@ -62,9 +62,10 @@ pub fn load_settings(read: &dyn Fn(&str) -> Option<String>) {
 }
 
 /// The world's acoustics for the sources playing now, from the blocks around the camera: how much each source is
-/// occluded and what its walls let through, and the reverb of the camera's surroundings. Called by the mod's `frame`
-/// hook in horizon-client, once a frame on the game thread (where the world is); works 20 times a second at most and
-/// publishes its results for the output to apply.
+/// occluded and what its walls let through, and the blocks the reverb of the camera's surroundings is simulated in.
+/// Called by the mod's `frame` hook in horizon-client, once a frame on the game thread (where the world is). The
+/// sources are looked at 20 times a second at most, and their results published for the output to apply; the blocks
+/// around the camera are copied a slice per frame and handed to the reflection simulation's thread.
 pub fn update_acoustics(
     audio: &Audio,
     world: &crate::world::World,
@@ -73,32 +74,42 @@ pub fn update_acoustics(
     use std::cell::RefCell;
     use std::time::{Duration, Instant};
     use steam_audio_hmod::acoustics::{self, Surface};
+    use steam_audio_hmod::reflections::{self, GridBuilder};
 
-    // Sources are looked at this often, the surroundings' reverb every other time.
+    // Sources are looked at this often.
     const PERIOD: Duration = Duration::from_millis(50);
     // At most this many sources, the nearest, and none farther than this.
     const MAX_SOURCES: usize = 32;
     const MAX_DISTANCE: f64 = 64.0;
+    // Blocks copied for the reverb per frame (a whole grid is 196 608).
+    const GRID_BUDGET: usize = 12_288;
 
-    // The game thread's state: when it last worked, and each block state's wall surface (0 unknown, 1 none,
-    // 2 + `Surface` index), for the block facts it was made from.
+    // The game thread's state: when it last looked, what it found then (the settings, the camera), each block state's
+    // wall surface (0 unknown, 1 none, 2 + `Surface` index) for the block facts it was made from, and the grid being
+    // copied.
     struct Cache {
         last: Option<Instant>,
-        reverb_turn: bool,
+        occlusion: bool,
+        reverb: bool,
+        listener: Option<[f64; 3]>,
         facts: usize,
         surfaces: Vec<u8>,
         sources: Vec<(u64, [f64; 3])>,
         results: Vec<(u64, acoustics::SourceAcoustics)>,
+        grid: GridBuilder,
     }
     thread_local! {
         static CACHE: RefCell<Cache> = const {
             RefCell::new(Cache {
                 last: None,
-                reverb_turn: false,
+                occlusion: false,
+                reverb: false,
+                listener: None,
                 facts: 0,
                 surfaces: Vec::new(),
                 sources: Vec::new(),
                 results: Vec::new(),
+                grid: GridBuilder::new(),
             })
         };
     }
@@ -107,38 +118,45 @@ pub fn update_acoustics(
         return;
     }
     CACHE.with_borrow_mut(|state| {
-        if state.last.is_some_and(|t| t.elapsed() < PERIOD) {
-            return;
-        }
-        state.last = Some(Instant::now());
-        state.reverb_turn = !state.reverb_turn;
-        let config = steam_audio_hmod::horizon::Config::get();
-        if !(config.occlusion || config.reverb) {
-            return;
-        }
-
-        // The camera and the sources it can hear, the mixer locked only to copy them.
-        let listener = {
-            let Ok(m) = audio.backend.mixer.lock() else {
-                return;
-            };
-            let here = m.worlds.get(&0).copied().unwrap_or_default();
-            let listener = m.listener;
+        let due = state.last.is_none_or(|t| t.elapsed() >= PERIOD);
+        let mut settings = None;
+        if due {
+            state.last = Some(Instant::now());
+            let config = steam_audio_hmod::horizon::Config::get();
+            state.occlusion = config.occlusion;
+            state.reverb = config.reverb;
+            settings = Some(config.acoustics());
             state.sources.clear();
-            for (&id, c) in &m.channels {
-                if c.state != State::Playing || c.relative || c.world != here {
-                    continue;
-                }
-                let at = [f64::from(c.at[0]), f64::from(c.at[1]), f64::from(c.at[2])];
-                let d2 = (0..3).map(|i| (at[i] - listener[i]).powi(2)).sum::<f64>();
-                let range = c
-                    .linear
-                    .map_or(MAX_DISTANCE, |max| f64::from(max).min(MAX_DISTANCE));
-                if d2 <= range * range {
-                    state.sources.push((id, at));
+            // The camera and the sources it can hear, the mixer locked only to copy them.
+            if config.occlusion || config.reverb {
+                let Ok(m) = audio.backend.mixer.lock() else {
+                    return;
+                };
+                let here = m.worlds.get(&0).copied().unwrap_or_default();
+                let listener = m.listener;
+                state.listener = Some(listener);
+                if config.occlusion {
+                    for (&id, c) in &m.channels {
+                        if c.state != State::Playing || c.relative || c.world != here {
+                            continue;
+                        }
+                        let at = [f64::from(c.at[0]), f64::from(c.at[1]), f64::from(c.at[2])];
+                        let d2 = (0..3).map(|i| (at[i] - listener[i]).powi(2)).sum::<f64>();
+                        let range = c
+                            .linear
+                            .map_or(MAX_DISTANCE, |max| f64::from(max).min(MAX_DISTANCE));
+                        if d2 <= range * range {
+                            state.sources.push((id, at));
+                        }
+                    }
                 }
             }
-            listener
+        }
+        if !(state.occlusion || state.reverb) {
+            return;
+        }
+        let Some(listener) = state.listener else {
+            return;
         };
         if state.sources.len() > MAX_SOURCES {
             let d2 = |at: [f64; 3]| (0..3).map(|i| (at[i] - listener[i]).powi(2)).sum::<f64>();
@@ -169,17 +187,24 @@ pub fn update_acoustics(
             (*slot >= 2).then(|| Surface::ALL[usize::from(*slot - 2)])
         };
 
-        let settings = config.acoustics();
-        state.results.clear();
-        if config.occlusion {
+        if let Some(settings) = settings {
+            state.results.clear();
             for &(id, at) in &state.sources {
                 let result = acoustics::source_acoustics(&mut wall, listener, at, &settings);
                 state.results.push((id, result));
             }
+            acoustics::publish(&state.results);
+            if state.reverb {
+                reflections::submit_listener(listener);
+            }
         }
-        let reverb = (config.reverb && state.reverb_turn)
-            .then(|| acoustics::environment_reverb(&mut wall, listener, &settings));
-        acoustics::publish(&state.results, reverb);
+        // The reverb's blocks: a slice of the grid around the camera each frame, the grid to the simulation when
+        // complete.
+        if state.reverb
+            && let Some(grid) = state.grid.step(listener, GRID_BUDGET, &mut wall)
+        {
+            reflections::submit_grid(grid);
+        }
     });
 }
 
@@ -227,6 +252,7 @@ fn render_binaural(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u
         let listener = mixer.listener;
         let world = mixer.worlds.get(&0).copied().unwrap_or_default();
         renderer.begin(owner);
+        renderer.set_orientation(forward.map(|v| v as f32), up.map(|v| v as f32));
         for (&id, c) in &mixer.channels {
             let Some((_, source_rate)) = &c.samples else {
                 continue;

@@ -20,23 +20,29 @@ use std::sync::{Mutex, OnceLock, RwLock};
 
 use crate::acoustics::{AcousticsSettings, Snapshot};
 use crate::air_absorption::AirAbsorptionModel;
-use crate::audio_buffer::{AudioBuffer, AudioSettings};
+use crate::audio_buffer::{AudioBuffer, AudioEffectState, AudioSettings};
 use crate::bands::NUM_BANDS;
-use crate::effects::{BinauralEffect, BinauralParams, EqEffect, ReverbEffect};
+use crate::effects::{
+    AmbisonicsDecodeEffect, AmbisonicsDecodeParams, BinauralEffect, BinauralParams, EqEffect,
+    HybridReverbEffect, HybridReverbIr, HybridReverbParams, OverlapSaveConvolutionSettings,
+};
 use crate::hrtf::{
     HrtfDatabase, HrtfInterpolation, HrtfNormalization, HrtfPhaseType, HrtfSettings, HrtfSource,
 };
-use crate::math::Vector3;
+use crate::math::{CoordinateSpace3, Vector3};
 use crate::random::CRand;
+use crate::reflections::{self, Reflections};
 use crate::simulation::Reverb;
+use crate::speaker_layout::{SpeakerLayout, SpeakerLayoutType};
 
 /// Samples per Steam Audio frame (about 10.7 ms at 48 kHz).
 pub const FRAME_SIZE: usize = 512;
 
-/// Steam Audio's parametric reverb gives out 0.063 of the energy it takes in with a 1 s reverb time (0.010 at 0.3 s,
-/// 0.25 at 3 s; measured by `measure_reverb_energy_gain`). This gain brings 1 s to unity: at a wet level of 1 the
-/// reverb of a 1 s room is as loud as what it was sent, and longer reverbs are louder, as in real rooms.
-const REVERB_GAIN: f32 = 4.0;
+/// The simulated reflections are physical: energy coming back to the listener from a source at the listener, relative
+/// to the direct sound 1 m from it. Horizon's sources are quieter with distance than that (linear, not 1/r), so the
+/// reverb is brought up by this gain: at a reverb level of 1, a 9 Г— 5 Г— 9 stone cave's reverb is about as loud as the
+/// sound sent to it (measured by `measure_reverb_level`).
+const REFLECTIONS_GAIN: f32 = 1.4;
 
 /// How the mod renders: the defaults, then what the player chose on the mod's settings page (Options > Mods,
 /// [`crate::settings`]), then the environment variables below, which win. It can change while the game runs
@@ -60,7 +66,7 @@ pub struct Config {
     /// `HORIZON_STEAM_AUDIO_OCCLUSION=0` turns occlusion and transmission through blocks off.
     pub occlusion: bool,
     /// `HORIZON_STEAM_AUDIO_WALLS=x` (0 to 1, default 0.35): how much walls muffle; 1 is Steam Audio's physical
-    /// transmission (a stone wall lets through about −36 dB), 0 lets everything through.
+    /// transmission (a stone wall lets through about в€’36 dB), 0 lets everything through.
     pub walls: f32,
     /// `HORIZON_STEAM_AUDIO_REVERB=0` turns the reverb of the surroundings off.
     pub reverb: bool,
@@ -154,7 +160,6 @@ impl Config {
     pub fn acoustics(&self) -> AcousticsSettings {
         AcousticsSettings {
             transmission_exponent: self.walls,
-            reverb_level: self.reverb_level,
             ..AcousticsSettings::default()
         }
     }
@@ -250,12 +255,21 @@ pub struct Renderer {
     stereo: AudioBuffer,
     /// The world acoustics published by the game thread.
     acoustics: Snapshot,
-    /// The reverb bus: what the sources send it, one parametric reverb per ear (different delay lines, so the two
-    /// sides are decorrelated), and the level the last frame ended at.
+    /// The reverb bus: what the sources send it (faded to the reverb level the last frame ended at), Steam Audio's
+    /// hybrid reverb of the simulated reflections into order-1 Ambisonics, and their binaural decoding in the
+    /// listener's orientation.
     reverb_in: AudioBuffer,
+    ambisonics: AudioBuffer,
     reverb_out: AudioBuffer,
-    reverbs: [ReverbEffect; 2],
+    hybrid: HybridReverbEffect,
+    decode: AmbisonicsDecodeEffect,
+    reverb_state: AudioEffectState,
     wet: f32,
+    /// The reflections being played (reverb times, parametric level per band, delay) and new ones not played yet.
+    reflections: Option<(Reverb, [f32; NUM_BANDS], usize)>,
+    pending: Option<Box<Reflections>>,
+    /// The listener's orientation in the world.
+    orientation: CoordinateSpace3,
     /// The current frame, interleaved stereo, and how many of its frames the callbacks took.
     block: Vec<f32>,
     taken: usize,
@@ -288,20 +302,36 @@ impl Renderer {
         let hrtf = HrtfDatabase::new(&settings, rate, FRAME_SIZE)
             .map_err(|e| format!("cannot load the HRTF at {rate} Hz: {e}"))?;
         let audio_settings = AudioSettings::new(rate, FRAME_SIZE);
-        let mut rand = CRand::default();
-        let reverbs = [
-            ReverbEffect::new(&audio_settings, &mut rand),
-            ReverbEffect::new(&audio_settings, &mut rand),
-        ];
+        let hybrid = HybridReverbEffect::new(
+            &audio_settings,
+            &OverlapSaveConvolutionSettings {
+                num_channels: reflections::NUM_CHANNELS,
+                ir_size: reflections::ir_size(rate),
+            },
+            &mut CRand::default(),
+        );
+        let decode = AmbisonicsDecodeEffect::new(
+            &audio_settings,
+            &SpeakerLayout::new(SpeakerLayoutType::Stereo),
+            reflections::ORDER,
+            Some(&hrtf),
+        );
+        reflections::set_rate(rate, FRAME_SIZE);
         Ok(Self {
             rate,
             settings: audio_settings,
             hrtf,
             acoustics: Snapshot::default(),
             reverb_in: AudioBuffer::new(1, FRAME_SIZE),
-            reverb_out: AudioBuffer::new(1, FRAME_SIZE),
-            reverbs,
+            ambisonics: AudioBuffer::new(reflections::NUM_CHANNELS, FRAME_SIZE),
+            reverb_out: AudioBuffer::new(2, FRAME_SIZE),
+            hybrid,
+            decode,
+            reverb_state: AudioEffectState::TailComplete,
             wet: 0.0,
+            reflections: None,
+            pending: None,
+            orientation: CoordinateSpace3::default(),
             air: AirAbsorptionModel::default(),
             states: HashMap::new(),
             voices: Vec::new(),
@@ -327,6 +357,20 @@ impl Renderer {
     /// Replaces the world acoustics it applies (normally what the game thread publishes).
     pub fn set_acoustics(&mut self, acoustics: Snapshot) {
         self.acoustics = acoustics;
+    }
+
+    /// Plays `reflections` from the next frame on (normally what the reflection simulation publishes).
+    pub fn set_reflections(&mut self, reflections: Box<Reflections>) {
+        self.pending = Some(reflections);
+    }
+
+    /// The listener's orientation: where it looks and its up, in the world (unit vectors, perpendicular). The
+    /// reverb's reflections turn with it.
+    pub fn set_orientation(&mut self, ahead: [f32; 3], up: [f32; 3]) {
+        let (ahead, up) = (Vector3::from_array(ahead), Vector3::from_array(up));
+        if ahead.length() > 0.5 && up.length() > 0.5 {
+            self.orientation = CoordinateSpace3::from_ahead_up(ahead, up, Vector3::ZERO);
+        }
     }
 
     /// Starts a callback for the mixer at `owner` (any value identifying it): forgets the last callback's sources.
@@ -415,9 +459,16 @@ impl Renderer {
             stereo,
             acoustics,
             reverb_in,
+            ambisonics,
             reverb_out,
-            reverbs,
+            hybrid,
+            decode,
+            reverb_state,
             wet,
+            reflections: playing_reflections,
+            pending,
+            orientation,
+            rate,
             block,
             ..
         } = self;
@@ -498,26 +549,62 @@ impl Renderer {
         // Sources that stopped, or left the binaural set, drop their state.
         states.retain(|_, state| state.frame == frame);
 
-        // The reverb bus: left and right from two reverbs, faded to the surroundings' level.
+        // The reverb bus: the simulated reflections of the surroundings (convolved, turning with the head) and their
+        // parametric tail. The level fades what goes in, so a change leaves the tail already ringing as it is.
         let target = if config.reverb {
-            acoustics.reverb.wet
+            config.reverb_level * REFLECTIONS_GAIN
         } else {
             0.0
         };
-        if target > 0.0 || *wet > 0.0 {
-            let reverb = Reverb {
-                reverb_times: acoustics.reverb.reverb_times,
-            };
-            for (ear, effect) in reverbs.iter_mut().enumerate() {
-                effect.apply(&reverb, reverb_in, reverb_out);
-                let n = FRAME_SIZE as f32;
-                for (j, (out, &s)) in block
-                    .chunks_exact_mut(2)
-                    .zip(reverb_out.channel(0))
-                    .enumerate()
-                {
-                    out[ear] += s * REVERB_GAIN * (*wet + (target - *wet) * (j as f32 / n));
+        if pending.is_none()
+            && let Some(new) = reflections::take()
+        {
+            if new.rate == *rate {
+                *pending = Some(new);
+            } else {
+                reflections::recycle(new.fir);
+            }
+        }
+        if target > 0.0 || *wet > 0.0 || *reverb_state == AudioEffectState::TailRemaining {
+            ramp(reverb_in.channel_mut(0), *wet, target);
+            let mut update = pending.take();
+            if let Some(new) = &update {
+                *playing_reflections = Some((new.reverb, new.eq, new.delay));
+            }
+            if let Some((reverb, eq, delay)) = playing_reflections.as_ref() {
+                let ir = match &mut update {
+                    Some(new) => HybridReverbIr::Updated(&mut new.fir),
+                    None => HybridReverbIr::Current,
+                };
+                *reverb_state = hybrid.apply(
+                    HybridReverbParams {
+                        ir,
+                        num_channels: reflections::NUM_CHANNELS,
+                        reverb,
+                        eq_coeffs: eq,
+                        delay: *delay,
+                    },
+                    reverb_in,
+                    ambisonics,
+                );
+                decode.apply(
+                    AmbisonicsDecodeParams {
+                        order: reflections::ORDER,
+                        orientation: *orientation,
+                        binaural: true,
+                        hrtf: Some(&*hrtf),
+                    },
+                    ambisonics,
+                    reverb_out,
+                );
+                for (j, out) in block.chunks_exact_mut(2).enumerate() {
+                    out[0] += reverb_out.channel(0)[j];
+                    out[1] += reverb_out.channel(1)[j];
                 }
+            }
+            // The effect handed back the impulse response it played until now.
+            if let Some(old) = update {
+                reflections::recycle(old.fir);
             }
         }
         *wet = target;
@@ -750,47 +837,77 @@ mod tests {
         assert!(Renderer::new(96_000, Config::default()).is_err());
     }
 
-    use crate::acoustics::{EnvironmentReverb, SourceAcoustics};
+    use crate::acoustics::{SourceAcoustics, Surface};
+    use crate::effects::{OverlapSaveFir, OverlapSavePartitioner};
+    use crate::reflections::{GRID_SIZE, GridBuilder, NUM_CHANNELS, Simulation, Voxels};
+    use crate::simulation::ImpulseResponse;
+    use std::sync::Arc;
 
-    fn renderer_with(sources: &[(u64, SourceAcoustics)], reverb: EnvironmentReverb) -> Renderer {
+    fn renderer_with(sources: &[(u64, SourceAcoustics)]) -> Renderer {
         let mut renderer =
             Renderer::new(48_000, Config::default()).expect("built-in HRTF at 48 kHz");
-        renderer.set_acoustics(Snapshot::fixed(sources.iter().copied().collect(), reverb));
+        renderer.set_acoustics(Snapshot::fixed(sources.iter().copied().collect()));
         renderer
     }
 
-    #[test]
-    #[ignore = "measurement"]
-    fn measure_reverb_energy_gain() {
-        let settings = AudioSettings::new(48_000, FRAME_SIZE);
-        for time in [0.3f32, 1.0, 3.0] {
-            let mut effect = ReverbEffect::new(&settings, &mut CRand::default());
-            let reverb = Reverb {
-                reverb_times: [time; NUM_BANDS],
-            };
-            let mut seed = 1u32;
-            let mut input = AudioBuffer::new(1, FRAME_SIZE);
-            let mut out = AudioBuffer::new(1, FRAME_SIZE);
-            let (mut e_in, mut e_out) = (0.0f64, 0.0f64);
-            for frame in 0..400 {
-                for s in input.channel_mut(0) {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 17;
-                    seed ^= seed << 5;
-                    *s = seed as f32 / u32::MAX as f32 - 0.5;
-                }
-                effect.apply(&reverb, &input, &mut out);
-                if frame >= 200 {
-                    e_in += input
-                        .channel(0)
-                        .iter()
-                        .map(|s| f64::from(s * s))
-                        .sum::<f64>();
-                    e_out += out.channel(0).iter().map(|s| f64::from(s * s)).sum::<f64>();
-                }
-            }
-            eprintln!("RT {time}: out/in energy {:.5}", e_out / e_in);
+    /// The simulated reflections of a stone cave of 9 × 5 × 9 blocks around the listener.
+    fn cave() -> Box<Reflections> {
+        let listener = [0.5, 65.6, 0.5];
+        let grid = Arc::new(Voxels::from_fn(
+            GridBuilder::origin_for(listener),
+            GRID_SIZE,
+            |c| {
+                let inside = c[0].abs() <= 4 && (64..69).contains(&c[1]) && c[2].abs() <= 4;
+                (!inside).then_some(Surface::Rock)
+            },
+        ));
+        let mut simulation = Simulation::new(48_000, FRAME_SIZE);
+        let mut last = None;
+        for _ in 0..4 {
+            last = simulation.run(&grid, listener, None);
         }
+        Box::new(last.expect("the listener is inside the grid"))
+    }
+
+    /// Reflections arriving from `direction` (world) only, for a quarter of a second, without a parametric tail.
+    fn reflections_from(direction: [f32; 3]) -> Box<Reflections> {
+        let size = reflections::ir_size(48_000);
+        let c = reflections::coefficients(Vector3::from_array(direction));
+        let mut ir = ImpulseResponse::with_size(NUM_CHANNELS, size);
+        let mut seed = 0x1234_5678_u32;
+        for k in 0..size / 4 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let n = (seed as f32 / u32::MAX as f32 - 0.5) * (-(k as f32) / 3000.0).exp();
+            for (ch, &coefficient) in c.iter().enumerate() {
+                ir.channel_mut(ch)[k] = coefficient * n;
+            }
+        }
+        let mut fir = OverlapSaveFir::new(NUM_CHANNELS, size, FRAME_SIZE);
+        OverlapSavePartitioner::new(FRAME_SIZE).partition(&ir, NUM_CHANNELS, size, &mut fir);
+        Box::new(Reflections {
+            rate: 48_000,
+            fir,
+            reverb: Reverb {
+                reverb_times: [0.1; NUM_BANDS],
+            },
+            eq: [0.0; NUM_BANDS],
+            delay: size,
+        })
+    }
+
+    /// Renders 0.2 s with no source playing and returns the energy of each ear over the last `from` frames on.
+    fn tail(renderer: &mut Renderer, from: usize) -> [f32; 2] {
+        let mut out = vec![0.0; 2 * 9600];
+        renderer.begin(1);
+        renderer.render(&mut out, 2, &mut |_, _, _| false);
+        let mut energy = [0.0; 2];
+        for frame in out.chunks_exact(2).skip(from) {
+            energy[0] += frame[0] * frame[0];
+            energy[1] += frame[1] * frame[1];
+        }
+        energy
     }
 
     #[test]
@@ -799,8 +916,8 @@ mod tests {
             occlusion: 0.0,
             transmission: [0.23, 0.11, 0.09],
         };
-        let mut open = renderer_with(&[], EnvironmentReverb::DRY);
-        let mut hidden = renderer_with(&[(7, walled)], EnvironmentReverb::DRY);
+        let mut open = renderer_with(&[]);
+        let mut hidden = renderer_with(&[(7, walled)]);
         let [l0, r0] = ear_energy(&mut open, Some([1.0, 0.0, 0.0]));
         let [l1, r1] = ear_energy(&mut hidden, Some([1.0, 0.0, 0.0]));
         let ratio = (l1 + r1) / (l0 + r0);
@@ -810,12 +927,9 @@ mod tests {
 
     #[test]
     fn an_enclosed_place_leaves_a_reverb_tail() {
-        let cave = EnvironmentReverb {
-            reverb_times: [1.4, 1.1, 0.7],
-            wet: 0.5,
-        };
-        let mut dry = renderer_with(&[], EnvironmentReverb::DRY);
-        let mut wet = renderer_with(&[], cave);
+        let mut dry = renderer_with(&[]);
+        let mut wet = renderer_with(&[]);
+        wet.set_reflections(cave());
         let direct = ear_energy(&mut dry, Some([0.0, 0.0, -1.0]));
         let with_reverb = ear_energy(&mut wet, Some([0.0, 0.0, -1.0]));
         let added = (with_reverb[0] + with_reverb[1]) / (direct[0] + direct[1]);
@@ -825,14 +939,57 @@ mod tests {
             "with reverb: {added} times the energy"
         );
         // After the source stops, the tail goes on.
-        let tail = |renderer: &mut Renderer| {
-            let mut out = vec![0.0; 2 * 9600];
-            renderer.begin(1);
-            renderer.render(&mut out, 2, &mut |_, _, _| false);
-            out[2 * 4800..].iter().map(|s| s * s).sum::<f32>()
-        };
-        let (dry_tail, wet_tail) = (tail(&mut dry), tail(&mut wet));
-        assert!(wet_tail > 1e-3, "wet tail {wet_tail}");
-        assert!(dry_tail < 1e-9, "dry tail {dry_tail}");
+        let [dl, dr] = tail(&mut dry, 4800);
+        let [wl, wr] = tail(&mut wet, 4800);
+        assert!(wl + wr > 1e-3, "wet tail {}", wl + wr);
+        assert!(dl + dr < 1e-9, "dry tail {}", dl + dr);
+    }
+
+    #[test]
+    fn reflections_turn_with_the_head() {
+        // A wall to the east (+x) reflects: on the right looking north (-z), on the left looking south.
+        let mut north = renderer_with(&[]);
+        north.set_reflections(reflections_from([1.0, 0.0, 0.0]));
+        let mut south = renderer_with(&[]);
+        south.set_reflections(reflections_from([1.0, 0.0, 0.0]));
+        south.set_orientation([0.0, 0.0, 1.0], [0.0, 1.0, 0.0]);
+        ear_energy(&mut north, Some([0.0, 0.0, -1.0]));
+        ear_energy(&mut south, Some([0.0, 0.0, -1.0]));
+        let [l, r] = tail(&mut north, 0);
+        assert!(r > 2.0 * l, "looking north: left {l}, right {r}");
+        let [l, r] = tail(&mut south, 0);
+        assert!(l > 2.0 * r, "looking south: left {l}, right {r}");
+    }
+
+    #[test]
+    fn turning_the_reverb_off_lets_the_tail_ring_out() {
+        let mut renderer = renderer_with(&[]);
+        renderer.set_reflections(cave());
+        ear_energy(&mut renderer, Some([0.0, 0.0, -1.0]));
+        renderer.config.reverb = false;
+        renderer.config_version = Config::version();
+        let [l, r] = tail(&mut renderer, 0);
+        assert!(l + r > 1e-3, "the tail rings out: {}", l + r);
+        // New sounds are dry.
+        let direct = ear_energy(&mut renderer_with(&[]), Some([0.0, 0.0, -1.0]));
+        let later = ear_energy(&mut renderer, Some([0.0, 0.0, -1.0]));
+        let ratio = (later[0] + later[1]) / (direct[0] + direct[1]);
+        assert!((ratio - 1.0).abs() < 0.05, "{ratio}");
+    }
+
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_reverb_level() {
+        let mut dry = renderer_with(&[]);
+        let mut wet = renderer_with(&[]);
+        wet.config.reverb_level = 1.0;
+        wet.set_reflections(cave());
+        let direct = ear_energy(&mut dry, Some([0.0, 0.0, -1.0]));
+        let with_reverb = ear_energy(&mut wet, Some([0.0, 0.0, -1.0]));
+        let added = (with_reverb[0] + with_reverb[1]) / (direct[0] + direct[1]) - 1.0;
+        eprintln!(
+            "cave at level 1: reverb {added:.4} of the direct energy; gain for unity {:.3}",
+            REFLECTIONS_GAIN / added.sqrt()
+        );
     }
 }
