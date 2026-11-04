@@ -1,5 +1,6 @@
 //! World acoustics for the Horizon renderer: how each source reaches the listener through the blocks between them
-//! (occlusion and transmission). The reverb of the surroundings is simulated in [`crate::reflections`].
+//! (occlusion and transmission). The way round a wall is found in [`crate::paths`], the reverb of the surroundings
+//! is simulated in [`crate::reflections`].
 //!
 //! Rays through the block grid, cast on the game thread (the world lives there): **occlusion** follows Steam Audio's
 //! volumetric occlusion: rays from the listener to the source and to points around it; the fraction that gets
@@ -18,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use crate::bands::NUM_BANDS;
+use crate::paths::PathAcoustics;
 use crate::scene::Material;
 
 /// What a wall is made of: Steam Audio's material presets (its Unity and Unreal plugins' `Generic`, `Brick`...).
@@ -162,11 +164,13 @@ impl Surface {
 }
 
 /// How one source reaches the listener: the fraction of its volume in plain sight and, along the line of sight,
-/// what gets through the walls in each band.
+/// what gets through the walls in each band; and, when it is hidden, the way round ([`crate::paths`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SourceAcoustics {
     pub occlusion: f32,
     pub transmission: [f32; NUM_BANDS],
+    /// The sound paths around what hides the source, heard for the part of it that is hidden (`1 − occlusion`).
+    pub path: Option<PathAcoustics>,
 }
 
 impl SourceAcoustics {
@@ -174,7 +178,16 @@ impl SourceAcoustics {
     pub const OPEN: Self = Self {
         occlusion: 1.0,
         transmission: [1.0; NUM_BANDS],
+        path: None,
     };
+
+    /// The gain of the way round, relative to the direct sound with nothing in the way: the paths' gain for the
+    /// hidden part of the source (0 without paths).
+    pub fn path_gain(&self) -> f32 {
+        self.path.map_or(0.0, |p| {
+            (1.0 - self.occlusion.clamp(0.0, 1.0)) * p.gain.clamp(0.0, 1.0)
+        })
+    }
 
     /// Band gains of the direct path (Steam Audio's `DirectEffect` with frequency-dependent transmission).
     pub fn direct_gains(&self) -> [f32; NUM_BANDS] {
@@ -187,6 +200,22 @@ impl SourceAcoustics {
         for (t, &goal) in self.transmission.iter_mut().zip(&target.transmission) {
             *t += (goal - *t) * rate;
         }
+        // A way round that appears fades in from where it is, one that goes fades out where it was.
+        self.path = match (self.path, target.path) {
+            (Some(mut current), Some(goal)) => {
+                current.approach(&goal, rate);
+                Some(current)
+            }
+            (Some(mut current), None) => {
+                current.gain *= 1.0 - rate;
+                (current.gain > 1e-3).then_some(current)
+            }
+            (None, Some(goal)) => Some(PathAcoustics {
+                gain: goal.gain * rate,
+                ..goal
+            }),
+            (None, None) => None,
+        };
     }
 }
 
@@ -321,6 +350,7 @@ pub fn source_acoustics(
     SourceAcoustics {
         occlusion,
         transmission,
+        path: None,
     }
 }
 
@@ -413,6 +443,11 @@ impl Snapshot {
         self.sources
             .get(&id)
             .map_or([1.0; NUM_BANDS], SourceAcoustics::direct_gains)
+    }
+
+    /// The acoustics of source `id`, if known.
+    pub fn get(&self, id: u64) -> Option<&SourceAcoustics> {
+        self.sources.get(&id)
     }
 }
 
@@ -557,9 +592,16 @@ mod tests {
 
     #[test]
     fn published_values_settle_smoothly() {
+        let path = PathAcoustics {
+            direction: [1.0, 0.0, 0.0],
+            gain: 0.8,
+            eq: [0.7, 0.5, 0.3],
+            distance: 12.0,
+        };
         let walled = SourceAcoustics {
             occlusion: 0.0,
             transmission: [0.2, 0.1, 0.05],
+            path: Some(path),
         };
         publish(&[(42, SourceAcoustics::OPEN)]);
         publish(&[(42, walled)]);
@@ -570,6 +612,18 @@ mod tests {
             halfway.occlusion > 0.4 && halfway.occlusion < 0.6,
             "{halfway:?}"
         );
+        // The way round fades in, from where it is.
+        let p = halfway.path.expect("fading in");
+        assert!(
+            p.gain > 0.3 && p.gain < 0.5 && p.direction == path.direction,
+            "{p:?}"
+        );
+        assert!(halfway.path_gain() < p.gain);
+        // ...and out.
+        publish(&[(42, SourceAcoustics::OPEN)]);
+        snapshot.update();
+        let fading = snapshot.sources[&42].path.expect("fading out");
+        assert!(fading.gain < p.gain, "{fading:?}");
         assert_eq!(snapshot.direct_gains(7), [1.0; NUM_BANDS]);
         publish(&[]);
         snapshot.update();

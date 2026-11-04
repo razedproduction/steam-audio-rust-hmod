@@ -1,6 +1,6 @@
 [mod]
 id = "steam_audio"
-version = "0.4.0"
+version = "0.5.0"
 
 [compatibility]
 # Nightly 2026-11-04 (tag nightly-source/2026-11-04-6475f62).
@@ -23,8 +23,8 @@ target = "horizon_client_render::audio::Audio::set_listener"
 helper = "listener.rs"
 bindings = [{ name = "audio", ty = "&mut Audio", value = "&mut *self" }]
 
-# Once a frame: the kept settings (first time), the occlusion of the playing sources and the reverb of the camera's
-# surroundings, from the blocks.
+# Once a frame: the kept settings (first time), the occlusion of the playing sources, their paths around walls and
+# the reverb of the camera's surroundings, from the blocks.
 [[injection]]
 id = "acoustics"
 hook = "frame"

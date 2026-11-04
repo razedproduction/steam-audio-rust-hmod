@@ -138,6 +138,11 @@ impl Voxels {
         }
     }
 
+    /// Whether the cell `local` (relative to the corner) is a wall; outside the grid, it is not.
+    pub fn is_wall_local(&self, local: [i32; 3]) -> bool {
+        self.local_index(local).is_some_and(|i| self.cells[i] != 0)
+    }
+
     /// Whether `position` (local) is far enough inside the grid to be simulated in.
     pub fn contains(&self, position: Vector3) -> bool {
         (0..3)
@@ -545,13 +550,13 @@ static RATE: AtomicU32 = AtomicU32::new(0);
 static FRAME_SIZE: AtomicU32 = AtomicU32::new(512);
 static STARTED: Once = Once::new();
 
-/// Gives the simulation a newly copied grid (game thread).
-pub fn submit_grid(grid: Voxels) {
+/// Gives the simulation a newly copied grid (game thread; the grid is shared with [`crate::paths`]).
+pub fn submit_grid(grid: &Arc<Voxels>) {
     start();
     let (lock, signal) = &*REQUEST;
     if let Ok(mut request) = lock.lock() {
-        if request.grid.as_deref() != Some(&grid) {
-            request.grid = Some(Arc::new(grid));
+        if request.grid.as_deref() != Some(&**grid) {
+            request.grid = Some(Arc::clone(grid));
             signal.notify_one();
         }
     }

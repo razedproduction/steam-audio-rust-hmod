@@ -13,7 +13,7 @@
 // stream mixed again: it was reopened (another device, a lost one). The mod then reopens its own on Horizon's
 // device and pauses the new one.
 //
-// The world's acoustics (occlusion, transmission, reverb) need the blocks, which live on the game thread: the mod's
+// The world's acoustics (occlusion, transmission, paths around walls, reverb) need the blocks, which live on the game thread: the mod's
 // `frame` hook in horizon-client calls `update_acoustics` with the world, and the output applies what it publishes.
 // The module is `pub` for that hook, and for the settings page's hooks (`mods`, `settings`, `settings_click`), which
 // hand over to `steam_audio_hmod::settings`.
@@ -62,10 +62,11 @@ pub fn load_settings(read: &dyn Fn(&str) -> Option<String>) {
 }
 
 /// The world's acoustics for the sources playing now, from the blocks around the camera: how much each source is
-/// occluded and what its walls let through, and the blocks the reverb of the camera's surroundings is simulated in.
-/// Called by the mod's `frame` hook in horizon-client, once a frame on the game thread (where the world is). The
-/// sources are looked at 20 times a second at most, and their results published for the output to apply; the blocks
-/// around the camera are copied a slice per frame and handed to the reflection simulation's thread.
+/// occluded, what its walls let through and the way round them, and the blocks the reverb and the paths are
+/// simulated in. Called by the mod's `frame` hook in horizon-client, once a frame on the game thread (where the world
+/// is). The sources are looked at 20 times a second at most, and their results published for the output to apply;
+/// the blocks around the camera are copied a slice per frame and handed to the reflection simulation's thread and to
+/// the pathing bake's.
 pub fn update_acoustics(
     audio: &Audio,
     world: &crate::world::World,
@@ -73,8 +74,13 @@ pub fn update_acoustics(
 ) {
     use std::cell::RefCell;
     use std::time::{Duration, Instant};
+    use std::sync::Arc;
     use steam_audio_hmod::acoustics::{self, Surface};
+    use steam_audio_hmod::paths;
     use steam_audio_hmod::reflections::{self, GridBuilder};
+
+    // A source's distance attenuation (Horizon's, with its own range), for the longer way round a wall.
+    type Attenuation = Box<dyn Fn(f32) -> f32>;
 
     // Sources are looked at this often.
     const PERIOD: Duration = Duration::from_millis(50);
@@ -90,11 +96,12 @@ pub fn update_acoustics(
     struct Cache {
         last: Option<Instant>,
         occlusion: bool,
+        pathing: bool,
         reverb: bool,
         listener: Option<[f64; 3]>,
         facts: usize,
         surfaces: Vec<u8>,
-        sources: Vec<(u64, [f64; 3])>,
+        sources: Vec<(u64, [f64; 3], Attenuation)>,
         results: Vec<(u64, acoustics::SourceAcoustics)>,
         grid: GridBuilder,
     }
@@ -103,6 +110,7 @@ pub fn update_acoustics(
             RefCell::new(Cache {
                 last: None,
                 occlusion: false,
+                pathing: false,
                 reverb: false,
                 listener: None,
                 facts: 0,
@@ -124,6 +132,7 @@ pub fn update_acoustics(
             state.last = Some(Instant::now());
             let config = steam_audio_hmod::horizon::Config::get();
             state.occlusion = config.occlusion;
+            state.pathing = config.occlusion && config.pathing;
             state.reverb = config.reverb;
             settings = Some(config.acoustics());
             state.sources.clear();
@@ -146,7 +155,10 @@ pub fn update_acoustics(
                             .linear
                             .map_or(MAX_DISTANCE, |max| f64::from(max).min(MAX_DISTANCE));
                         if d2 <= range * range {
-                            state.sources.push((id, at));
+                            let linear = c.linear;
+                            let attenuation: Attenuation =
+                                Box::new(move |d| distance_gain(linear, d));
+                            state.sources.push((id, at, attenuation));
                         }
                     }
                 }
@@ -158,8 +170,8 @@ pub fn update_acoustics(
         let Some(listener) = state.listener else {
             return;
         };
+        let d2 = |at: [f64; 3]| (0..3).map(|i| (at[i] - listener[i]).powi(2)).sum::<f64>();
         if state.sources.len() > MAX_SOURCES {
-            let d2 = |at: [f64; 3]| (0..3).map(|i| (at[i] - listener[i]).powi(2)).sum::<f64>();
             state.sources.sort_by(|a, b| d2(a.1).total_cmp(&d2(b.1)));
             state.sources.truncate(MAX_SOURCES);
         }
@@ -189,21 +201,43 @@ pub fn update_acoustics(
 
         if let Some(settings) = settings {
             state.results.clear();
-            for &(id, at) in &state.sources {
-                let result = acoustics::source_acoustics(&mut wall, listener, at, &settings);
-                state.results.push((id, result));
+            // The paths baked in the blocks around the camera, for the sources a wall hides.
+            let baked = if state.pathing { paths::latest() } else { None };
+            for (id, at, attenuation) in &state.sources {
+                let mut result = acoustics::source_acoustics(&mut wall, listener, *at, &settings);
+                if result.occlusion < 1.0
+                    && let Some(baked) = &baked
+                    && let Some(mut path) = baked.find(listener, *at)
+                {
+                    // The way round is longer: Horizon's attenuation over its length, relative to the straight one.
+                    let straight = attenuation(d2(*at).sqrt() as f32);
+                    let round = attenuation(path.distance);
+                    path.gain *= if straight > 0.0 {
+                        (round / straight).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    result.path = (path.gain > 0.0).then_some(path);
+                }
+                state.results.push((*id, result));
             }
             acoustics::publish(&state.results);
             if state.reverb {
                 reflections::submit_listener(listener);
             }
         }
-        // The reverb's blocks: a slice of the grid around the camera each frame, the grid to the simulation when
-        // complete.
-        if state.reverb
+        // The blocks around the camera, for the reverb and the paths: a slice of the grid each frame, the grid to
+        // the simulation and the pathing bake when complete.
+        if (state.reverb || state.pathing)
             && let Some(grid) = state.grid.step(listener, GRID_BUDGET, &mut wall)
         {
-            reflections::submit_grid(grid);
+            let grid = Arc::new(grid);
+            if state.reverb {
+                reflections::submit_grid(&grid);
+            }
+            if state.pathing {
+                paths::submit_grid(&grid);
+            }
         }
     });
 }

@@ -5,7 +5,8 @@
 //! absorption model ([`EqEffect`]) and rendered binaurally with the built-in CIPIC HRTF ([`BinauralEffect`]); sources
 //! without a direction (music, the UI, sounds at the listener) and those beyond the voice budget keep Horizon's own
 //! stereo gains. Distance attenuation stays Horizon's (vanilla's linear model), so what can be heard and how loud
-//! does not change, only how it sounds.
+//! does not change, only how it sounds. A source hidden by walls is also heard the way round them, from where its
+//! paths arrive ([`crate::paths`]), with a second binaural voice.
 //!
 //! Steam Audio's effects work on fixed frames, the output callback asks for any number of frames: the renderer mixes
 //! whole frames of [`FRAME_SIZE`] into a buffer and serves the callback from it, at most one frame late.
@@ -68,6 +69,9 @@ pub struct Config {
     /// `HORIZON_STEAM_AUDIO_WALLS=x` (0 to 1, default 0.35): how much walls muffle; 1 is Steam Audio's physical
     /// transmission (a stone wall lets through about в€’36 dB), 0 lets everything through.
     pub walls: f32,
+    /// `HORIZON_STEAM_AUDIO_PATHING=0` turns the sound paths around walls off (with occlusion on, a hidden source
+    /// is then heard through the wall only).
+    pub pathing: bool,
     /// `HORIZON_STEAM_AUDIO_REVERB=0` turns the reverb of the surroundings off.
     pub reverb: bool,
     /// `HORIZON_STEAM_AUDIO_REVERB_LEVEL=x` (0 to 2, default 0.5): reverb level in a fully enclosed place.
@@ -85,6 +89,7 @@ impl Default for Config {
             hrtf_path: None,
             occlusion: true,
             walls: 0.35,
+            pathing: true,
             reverb: true,
             reverb_level: 0.5,
         }
@@ -128,6 +133,7 @@ impl Config {
         switch("HORIZON_STEAM_AUDIO", &mut self.enabled);
         switch("HORIZON_STEAM_AUDIO_AIR", &mut self.air_absorption);
         switch("HORIZON_STEAM_AUDIO_OCCLUSION", &mut self.occlusion);
+        switch("HORIZON_STEAM_AUDIO_PATHING", &mut self.pathing);
         switch("HORIZON_STEAM_AUDIO_REVERB", &mut self.reverb);
         let number = |name: &str, range: std::ops::RangeInclusive<f32>, value: &mut f32| {
             if let Some(v) = var(name).and_then(|v| parse_number(&v, range)) {
@@ -235,6 +241,20 @@ struct VoiceState {
     gain: f32,
     /// The frame it was last rendered in ([`Renderer::frame`]).
     frame: u64,
+    /// The way round the walls hiding it, while there is one or its sound fades out.
+    path: Option<PathVoice>,
+}
+
+/// The sound of a source coming round what hides it ([`crate::paths`]): a second binaural voice, from where the
+/// paths arrive, with what their bends and length take off each band.
+#[derive(Debug)]
+struct PathVoice {
+    binaural: BinauralEffect,
+    eq: EqEffect,
+    /// Band gains (normalized), the gain the last frame ended at and the direction (world) last played.
+    eq_gains: [f32; NUM_BANDS],
+    gain: f32,
+    direction: [f32; 3],
 }
 
 /// Binaural mixing of Horizon's sources at one sampling rate.
@@ -252,6 +272,8 @@ pub struct Renderer {
     playing: Vec<bool>,
     order: Vec<usize>,
     mono: AudioBuffer,
+    /// A source's samples before the direct path's EQ, for its path round the walls.
+    dry: AudioBuffer,
     stereo: AudioBuffer,
     /// The world acoustics published by the game thread.
     acoustics: Snapshot,
@@ -339,6 +361,7 @@ impl Renderer {
             playing: Vec::new(),
             order: Vec::new(),
             mono: AudioBuffer::new(1, FRAME_SIZE),
+            dry: AudioBuffer::new(1, FRAME_SIZE),
             stereo: AudioBuffer::new(2, FRAME_SIZE),
             block: vec![0.0; 2 * FRAME_SIZE],
             taken: FRAME_SIZE,
@@ -456,6 +479,7 @@ impl Renderer {
             binaural,
             playing,
             mono,
+            dry,
             stereo,
             acoustics,
             reverb_in,
@@ -511,6 +535,29 @@ impl Renderer {
             let mut eq_gains: [f32; NUM_BANDS] = std::array::from_fn(|b| air_gains[b] * direct[b]);
             let mut overall = 1.0;
             EqEffect::normalize_gains(&mut eq_gains, &mut overall);
+            // The way round the walls, for the hidden part of the source: band gains (the bends, and the air along
+            // the longer way), gain and direction.
+            let path = if config.occlusion && config.pathing {
+                acoustics.get(voice.id).and_then(|a| {
+                    let p = a.path?;
+                    let gain = a.path_gain();
+                    (gain > 0.0).then(|| {
+                        let mut eq: [f32; NUM_BANDS] = std::array::from_fn(|b| {
+                            let air = if config.air_absorption {
+                                air.evaluate(p.distance.max(0.0), b)
+                            } else {
+                                1.0
+                            };
+                            air * p.eq[b]
+                        });
+                        let mut overall = 1.0;
+                        EqEffect::normalize_gains(&mut eq, &mut overall);
+                        (eq, gain * overall, p.direction)
+                    })
+                })
+            } else {
+                None
+            };
             match (binaural[i], voice.direction) {
                 (true, Some(direction)) => {
                     let state = states.entry(voice.id).or_insert_with(|| VoiceState {
@@ -518,8 +565,12 @@ impl Renderer {
                         eq: EqEffect::new(settings),
                         gain: voice.gain * overall,
                         frame,
+                        path: None,
                     });
                     state.frame = frame;
+                    if path.is_some() || state.path.is_some() {
+                        dry.channel_mut(0).copy_from_slice(mono.channel(0));
+                    }
                     state.eq.apply_in_place(&eq_gains, mono);
                     let gain = voice.gain * overall;
                     ramp(mono.channel_mut(0), state.gain, gain);
@@ -534,10 +585,51 @@ impl Renderer {
                         out[0] += stereo.channel(0)[j];
                         out[1] += stereo.channel(1)[j];
                     }
+                    // The way round: from where the paths arrive, turning with the head. When it goes, its last
+                    // sound fades out over a frame.
+                    let target = match path {
+                        Some((eq, gain, direction)) => {
+                            let p = state.path.get_or_insert_with(|| PathVoice {
+                                binaural: BinauralEffect::new(settings, hrtf),
+                                eq: EqEffect::new(settings),
+                                eq_gains: eq,
+                                gain: 0.0,
+                                direction,
+                            });
+                            p.eq_gains = eq;
+                            p.direction = direction;
+                            voice.gain * gain
+                        }
+                        None => 0.0,
+                    };
+                    if let Some(p) = &mut state.path {
+                        p.eq.apply_in_place(&p.eq_gains, dry);
+                        ramp(dry.channel_mut(0), p.gain, target);
+                        let local =
+                            orientation.direction_world_to_local(Vector3::from_array(p.direction));
+                        let mut params = BinauralParams::new(local, hrtf);
+                        if config.bilinear {
+                            params.interpolation = HrtfInterpolation::Bilinear;
+                        }
+                        params.phase_type = HrtfPhaseType::None;
+                        p.binaural.apply(params, dry, stereo);
+                        for (j, out) in block.chunks_exact_mut(2).enumerate() {
+                            out[0] += stereo.channel(0)[j];
+                            out[1] += stereo.channel(1)[j];
+                        }
+                        let silent = p.gain == 0.0 && target == 0.0;
+                        p.gain = target;
+                        if silent {
+                            state.path = None;
+                        }
+                    }
                 }
                 _ => {
-                    // Beyond the binaural budget: Horizon's panning, with the walls' and the air's mean loss.
-                    let loss = eq_gains.iter().sum::<f32>() / NUM_BANDS as f32 * overall;
+                    // Beyond the binaural budget: Horizon's panning, with the walls' and the air's mean loss, and
+                    // the way round's mean gain.
+                    let mean = |g: &[f32; NUM_BANDS]| g.iter().sum::<f32>() / NUM_BANDS as f32;
+                    let loss = mean(&eq_gains) * overall
+                        + path.map_or(0.0, |(eq, gain, _)| mean(&eq) * gain);
                     let [left, right] = voice.pan.map(|pan| pan * voice.gain * loss);
                     for (out, &s) in block.chunks_exact_mut(2).zip(mono.channel(0)) {
                         out[0] += s * left;
@@ -839,6 +931,7 @@ mod tests {
 
     use crate::acoustics::{SourceAcoustics, Surface};
     use crate::effects::{OverlapSaveFir, OverlapSavePartitioner};
+    use crate::paths::PathAcoustics;
     use crate::reflections::{GRID_SIZE, GridBuilder, NUM_CHANNELS, Simulation, Voxels};
     use crate::simulation::ImpulseResponse;
     use std::sync::Arc;
@@ -915,6 +1008,7 @@ mod tests {
         let walled = SourceAcoustics {
             occlusion: 0.0,
             transmission: [0.23, 0.11, 0.09],
+            path: None,
         };
         let mut open = renderer_with(&[]);
         let mut hidden = renderer_with(&[(7, walled)]);
@@ -923,6 +1017,41 @@ mod tests {
         let ratio = (l1 + r1) / (l0 + r0);
         assert!(ratio < 0.1, "behind a wall: {ratio} of the energy");
         assert!(r1 > l1, "still on the right: left {l1}, right {r1}");
+    }
+
+    #[test]
+    fn a_hidden_source_comes_round_from_where_its_path_arrives() {
+        // The source is to the right behind a wall; the doorway is to the left (the listener looks north, -z).
+        let walled = SourceAcoustics {
+            occlusion: 0.0,
+            transmission: [0.23, 0.11, 0.09],
+            path: Some(PathAcoustics {
+                direction: [-1.0, 0.0, 0.0],
+                gain: 0.8,
+                eq: [0.9, 0.6, 0.4],
+                distance: 9.0,
+            }),
+        };
+        let mut open = renderer_with(&[]);
+        let mut round = renderer_with(&[(7, walled)]);
+        let mut through = renderer_with(&[(7, walled)]);
+        through.config.pathing = false;
+        through.config_version = Config::version();
+        let [l0, r0] = ear_energy(&mut open, Some([1.0, 0.0, 0.0]));
+        let [l1, r1] = ear_energy(&mut round, Some([1.0, 0.0, 0.0]));
+        let [l2, r2] = ear_energy(&mut through, Some([1.0, 0.0, 0.0]));
+        assert!(round.states[&7].path.is_some(), "a path voice");
+        assert!(through.states[&7].path.is_none());
+        assert!(
+            l1 > 2.0 * r1,
+            "from the doorway, on the left: left {l1}, right {r1}"
+        );
+        let (open, round, through) = (l0 + r0, l1 + r1, l2 + r2);
+        assert!(
+            round > 3.0 * through,
+            "round {round}, through the wall {through}"
+        );
+        assert!(round < open, "round {round}, open {open}");
     }
 
     #[test]

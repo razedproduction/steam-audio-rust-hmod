@@ -21,9 +21,10 @@ pub fn title() -> String {
 
 pub fn description(language: &str) -> String {
     if russian(language) {
-        "Бинауральный звук Steam Audio: HRTF, поглощение в воздухе, стены и реверберация. Для наушников.".into()
+        "Бинауральный звук Steam Audio: HRTF, поглощение в воздухе, стены, пути вокруг них и реверберация. Для наушников."
+            .into()
     } else {
-        "Steam Audio's binaural sound: HRTF, air absorption, walls and reverb. Made for headphones."
+        "Steam Audio's binaural sound: HRTF, air absorption, walls, paths around them and reverb. Made for headphones."
             .into()
     }
 }
@@ -35,6 +36,7 @@ pub enum Item {
     AirAbsorption,
     Occlusion,
     Walls,
+    Pathing,
     Reverb,
     ReverbLevel,
     Interpolation,
@@ -43,11 +45,12 @@ pub enum Item {
 }
 
 /// The page's buttons, in order.
-pub const ITEMS: [Item; 9] = [
+pub const ITEMS: [Item; 10] = [
     Item::Enabled,
     Item::AirAbsorption,
     Item::Occlusion,
     Item::Walls,
+    Item::Pathing,
     Item::Reverb,
     Item::ReverbLevel,
     Item::Interpolation,
@@ -100,6 +103,8 @@ pub fn labels(config: &Config, language: &str) -> Vec<String> {
             (Item::Occlusion, false) => format!("Walls muffle sound: {}", on_off(config.occlusion)),
             (Item::Walls, true) => format!("Сила стен: {}", percent(config.walls)),
             (Item::Walls, false) => format!("Wall strength: {}", percent(config.walls)),
+            (Item::Pathing, true) => format!("Звук огибает стены: {}", on_off(config.pathing)),
+            (Item::Pathing, false) => format!("Sound goes round walls: {}", on_off(config.pathing)),
             (Item::Reverb, true) => format!("Реверберация: {}", on_off(config.reverb)),
             (Item::Reverb, false) => format!("Reverb: {}", on_off(config.reverb)),
             (Item::ReverbLevel, true) => {
@@ -143,6 +148,7 @@ pub fn click(config: &mut Config, index: usize) -> bool {
         Item::AirAbsorption => config.air_absorption = !config.air_absorption,
         Item::Occlusion => config.occlusion = !config.occlusion,
         Item::Walls => config.walls = next(&WALLS, config.walls + 1e-4),
+        Item::Pathing => config.pathing = !config.pathing,
         Item::Reverb => config.reverb = !config.reverb,
         Item::ReverbLevel => config.reverb_level = next(&REVERB_LEVELS, config.reverb_level + 1e-4),
         Item::Interpolation => config.bilinear = !config.bilinear,
@@ -160,13 +166,14 @@ pub fn click(config: &mut Config, index: usize) -> bool {
 }
 
 /// The keys the page keeps, and their values in `config`.
-pub fn values(config: &Config) -> [(&'static str, String); 8] {
+pub fn values(config: &Config) -> [(&'static str, String); 9] {
     let switch = |on: bool| if on { "on" } else { "off" }.to_owned();
     [
         ("enabled", switch(config.enabled)),
         ("air_absorption", switch(config.air_absorption)),
         ("occlusion", switch(config.occlusion)),
         ("walls", config.walls.to_string()),
+        ("pathing", switch(config.pathing)),
         ("reverb", switch(config.reverb)),
         ("reverb_level", config.reverb_level.to_string()),
         (
@@ -192,6 +199,7 @@ pub fn apply_saved(config: &mut Config, read: &dyn Fn(&str) -> Option<String>) {
     switch("enabled", &mut config.enabled);
     switch("air_absorption", &mut config.air_absorption);
     switch("occlusion", &mut config.occlusion);
+    switch("pathing", &mut config.pathing);
     switch("reverb", &mut config.reverb);
     if let Some(v) = read("walls").and_then(|v| parse_number(&v, 0.0..=1.0)) {
         config.walls = v;
@@ -244,10 +252,11 @@ mod tests {
         assert_eq!(en.len(), ITEMS.len());
         assert_eq!(en[0], "Steam Audio: On");
         assert_eq!(en[3], "Wall strength: 35%");
-        assert_eq!(en[5], "Reverb level: 50%");
+        assert_eq!(en[4], "Sound goes round walls: On");
+        assert_eq!(en[6], "Reverb level: 50%");
         let ru = labels(&config, "ru_ru");
         assert_eq!(ru[2], "Стены глушат звук: Вкл");
-        assert_eq!(ru[7], "Бинауральных голосов: 32");
+        assert_eq!(ru[8], "Бинауральных голосов: 32");
         assert!(description("ru_ru").contains("наушников"));
     }
 
@@ -263,13 +272,13 @@ mod tests {
             })
             .collect();
         assert_eq!(walls, [0.5, 0.75, 1.0, 0.0, 0.15, 0.25, 0.35]);
-        click(&mut config, 7);
+        click(&mut config, 8);
         assert_eq!(config.max_binaural_voices, 48);
         config.max_binaural_voices = 20;
-        click(&mut config, 7);
+        click(&mut config, 8);
         assert_eq!(config.max_binaural_voices, 32);
         config.max_binaural_voices = 100;
-        click(&mut config, 7);
+        click(&mut config, 8);
         assert_eq!(config.max_binaural_voices, 8);
         assert!(!click(&mut config, 99));
     }
@@ -294,8 +303,9 @@ mod tests {
     fn kept_values_round_trip_and_bad_ones_are_ignored() {
         let mut changed = Config::default();
         click(&mut changed, 2);
-        click(&mut changed, 5);
+        click(&mut changed, 4);
         click(&mut changed, 6);
+        click(&mut changed, 7);
         let kept: HashMap<&str, String> = values(&changed).into_iter().collect();
         let mut loaded = Config::default();
         apply_saved(&mut loaded, &|key| kept.get(key).cloned());
