@@ -1,0 +1,29 @@
+[mod]
+id = "steam_audio"
+version = "0.1.0"
+
+[compatibility]
+# Nightly 2026-11-04 (tag nightly-source/2026-11-04-6475f62).
+horizon_revision = "6475f62f3c834b7489e1816bf47f47ea5eb2b879"
+
+# `crate::audio::steam_audio`: the mod's output stream and its Steam Audio rendering of Horizon's mixer
+# (see the top of output.rs).
+[[module]]
+id = "output"
+file = "crates/horizon-client-render/src/audio.rs"
+name = "steam_audio"
+source = "output.rs"
+
+# At each camera update, take the sound output over (once per output Horizon opens).
+[[injection]]
+id = "take-over-output"
+kind = "HEAD"
+target = "horizon_client_render::audio::Audio::set_listener"
+helper = "listener.rs"
+bindings = [{ name = "audio", ty = "&mut Audio", value = "&mut *self" }]
+
+# steam-audio-rust, vendored, plus the renderer (`steam_audio_hmod::horizon`).
+[[crate]]
+id = "engine"
+path = "engine"
+dependent = "horizon-client-render"

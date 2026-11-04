@@ -1,0 +1,8 @@
+steam-audio-rust
+Copyright 2026 razed.production
+
+This product is a Rust reimplementation of Steam Audio.
+Steam Audio is Copyright (C) Valve Corporation and is licensed under the
+Apache License, Version 2.0: https://github.com/ValveSoftware/steam-audio
+
+This project is not affiliated with or endorsed by Valve Corporation.

@@ -1,0 +1,9 @@
+# Development workspace: builds and tests the bundle's crate on its own. It is not part of the mod file
+# (`tools/package.py` packs only `mixins/steam_audio/`); in the game, horizon-mixins stages the crate into Horizon's
+# own workspace and lock file.
+[workspace]
+resolver = "3"
+members = ["mixins/steam_audio/engine"]
+
+[profile.test]
+opt-level = 2

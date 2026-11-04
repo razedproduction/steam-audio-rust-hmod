@@ -1,0 +1,23 @@
+[package]
+name = "steam-audio-hmod"
+description = "steam-audio-rust (a Rust port of Valve's Steam Audio) vendored for Horizon, with a binaural renderer for Horizon's mixer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "steam_audio_hmod"
+
+# Only registry crates already in Horizon's Cargo.lock may be named here (horizon-mixins refuses the rest).
+# steam-audio-rust's `realfft`, `rustfft` and `num-complex` are not there, so this copy carries its own
+# FFT (`src/fft.rs`) and complex type (`src/complex.rs`). SOFA files are left out (no `sofa` crate).
+[dependencies]
+log = "0.4"
+thiserror = "2"
+
+[lints.rust]
+unsafe_code = "deny"
+# The vendored sources keep upstream's `#[cfg(feature = "sofa")]` code; the feature is never enabled here.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("sofa"))'] }
