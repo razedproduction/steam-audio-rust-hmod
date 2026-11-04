@@ -17,17 +17,25 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use crate::acoustics::{AcousticsSettings, Snapshot};
 use crate::air_absorption::AirAbsorptionModel;
 use crate::audio_buffer::{AudioBuffer, AudioSettings};
 use crate::bands::NUM_BANDS;
-use crate::effects::{BinauralEffect, BinauralParams, EqEffect};
+use crate::effects::{BinauralEffect, BinauralParams, EqEffect, ReverbEffect};
 use crate::hrtf::{
     HrtfDatabase, HrtfInterpolation, HrtfNormalization, HrtfPhaseType, HrtfSettings, HrtfSource,
 };
 use crate::math::Vector3;
+use crate::random::CRand;
+use crate::simulation::Reverb;
 
 /// Samples per Steam Audio frame (about 10.7 ms at 48 kHz).
 pub const FRAME_SIZE: usize = 512;
+
+/// Steam Audio's parametric reverb gives out 0.063 of the energy it takes in with a 1 s reverb time (0.010 at 0.3 s,
+/// 0.25 at 3 s; measured by `measure_reverb_energy_gain`). This gain brings 1 s to unity: at a wet level of 1 the
+/// reverb of a 1 s room is as loud as what it was sent, and longer reverbs are louder, as in real rooms.
+const REVERB_GAIN: f32 = 4.0;
 
 /// How the mod renders, from the environment (read once).
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +54,15 @@ pub struct Config {
     pub volume_db: f32,
     /// `HORIZON_STEAM_AUDIO_HRTF=path`: an HRTF in Steam Audio's `.hrtf` format instead of the built-in one.
     pub hrtf_path: Option<std::path::PathBuf>,
+    /// `HORIZON_STEAM_AUDIO_OCCLUSION=0` turns occlusion and transmission through blocks off.
+    pub occlusion: bool,
+    /// `HORIZON_STEAM_AUDIO_WALLS=x` (0 to 1, default 0.35): how much walls muffle; 1 is Steam Audio's physical
+    /// transmission (a stone wall lets through about в€’36 dB), 0 lets everything through.
+    pub walls: f32,
+    /// `HORIZON_STEAM_AUDIO_REVERB=0` turns the reverb of the surroundings off.
+    pub reverb: bool,
+    /// `HORIZON_STEAM_AUDIO_REVERB_LEVEL=x` (0 to 2, default 0.5): reverb level in a fully enclosed place.
+    pub reverb_level: f32,
 }
 
 impl Default for Config {
@@ -57,6 +74,10 @@ impl Default for Config {
             max_binaural_voices: 32,
             volume_db: 0.0,
             hrtf_path: None,
+            occlusion: true,
+            walls: 0.35,
+            reverb: true,
+            reverb_level: 0.5,
         }
     }
 }
@@ -73,7 +94,21 @@ impl Config {
             })
         };
         let default = Self::default();
+        let number = |name: &str, range: std::ops::RangeInclusive<f32>, fallback: f32| {
+            var(name)
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| v.is_finite())
+                .map_or(fallback, |v| v.clamp(*range.start(), *range.end()))
+        };
         Self {
+            occlusion: !off("HORIZON_STEAM_AUDIO_OCCLUSION"),
+            walls: number("HORIZON_STEAM_AUDIO_WALLS", 0.0..=1.0, default.walls),
+            reverb: !off("HORIZON_STEAM_AUDIO_REVERB"),
+            reverb_level: number(
+                "HORIZON_STEAM_AUDIO_REVERB_LEVEL",
+                0.0..=2.0,
+                default.reverb_level,
+            ),
             enabled: !off("HORIZON_STEAM_AUDIO"),
             air_absorption: !off("HORIZON_STEAM_AUDIO_AIR"),
             bilinear: var("HORIZON_STEAM_AUDIO_INTERPOLATION")
@@ -88,6 +123,15 @@ impl Config {
             hrtf_path: var("HORIZON_STEAM_AUDIO_HRTF")
                 .filter(|v| !v.trim().is_empty())
                 .map(Into::into),
+        }
+    }
+
+    /// The world acoustics' tuning for this configuration.
+    pub fn acoustics(&self) -> AcousticsSettings {
+        AcousticsSettings {
+            transmission_exponent: self.walls,
+            reverb_level: self.reverb_level,
+            ..AcousticsSettings::default()
         }
     }
 
@@ -147,6 +191,14 @@ pub struct Renderer {
     order: Vec<usize>,
     mono: AudioBuffer,
     stereo: AudioBuffer,
+    /// The world acoustics published by the game thread.
+    acoustics: Snapshot,
+    /// The reverb bus: what the sources send it, one parametric reverb per ear (different delay lines, so the two
+    /// sides are decorrelated), and the level the last frame ended at.
+    reverb_in: AudioBuffer,
+    reverb_out: AudioBuffer,
+    reverbs: [ReverbEffect; 2],
+    wet: f32,
     /// The current frame, interleaved stereo, and how many of its frames the callbacks took.
     block: Vec<f32>,
     taken: usize,
@@ -176,10 +228,21 @@ impl Renderer {
         };
         let hrtf = HrtfDatabase::new(&settings, rate, FRAME_SIZE)
             .map_err(|e| format!("cannot load the HRTF at {rate} Hz: {e}"))?;
+        let audio_settings = AudioSettings::new(rate, FRAME_SIZE);
+        let mut rand = CRand::default();
+        let reverbs = [
+            ReverbEffect::new(&audio_settings, &mut rand),
+            ReverbEffect::new(&audio_settings, &mut rand),
+        ];
         Ok(Self {
             rate,
-            settings: AudioSettings::new(rate, FRAME_SIZE),
+            settings: audio_settings,
             hrtf,
+            acoustics: Snapshot::default(),
+            reverb_in: AudioBuffer::new(1, FRAME_SIZE),
+            reverb_out: AudioBuffer::new(1, FRAME_SIZE),
+            reverbs,
+            wet: 0.0,
             air: AirAbsorptionModel::default(),
             states: HashMap::new(),
             voices: Vec::new(),
@@ -199,6 +262,11 @@ impl Renderer {
     /// The sampling rate it renders at.
     pub fn rate(&self) -> u32 {
         self.rate
+    }
+
+    /// Replaces the world acoustics it applies (normally what the game thread publishes).
+    pub fn set_acoustics(&mut self, acoustics: Snapshot) {
+        self.acoustics = acoustics;
     }
 
     /// Starts a callback for the mixer at `owner` (any value identifying it): forgets the last callback's sources.
@@ -221,6 +289,7 @@ impl Renderer {
     pub fn render(&mut self, out: &mut [f32], channels: usize, read: &mut ReadSource<'_>) {
         assert!(channels >= 2, "binaural output needs two channels");
         out.fill(0.0);
+        self.acoustics.update();
         self.choose_binaural();
         self.playing.clear();
         self.playing.resize(self.voices.len(), true);
@@ -269,31 +338,66 @@ impl Renderer {
             playing,
             mono,
             stereo,
+            acoustics,
+            reverb_in,
+            reverb_out,
+            reverbs,
+            wet,
             block,
             ..
         } = self;
+        reverb_in.make_silent();
         for (i, voice) in voices.iter().enumerate() {
             if !playing[i] {
                 continue;
             }
             playing[i] = read(voice.id, voice.step, mono.channel_mut(0));
+            if voice.direction.is_none() || voice.gain == 0.0 {
+                // Music, the UI, sounds at the listener: as Horizon pans them, dry.
+                let [left, right] = voice.pan.map(|pan| pan * voice.gain);
+                if left != 0.0 || right != 0.0 {
+                    for (out, &s) in block.chunks_exact_mut(2).zip(mono.channel(0)) {
+                        out[0] += s * left;
+                        out[1] += s * right;
+                    }
+                }
+                continue;
+            }
+            // Air absorption, then what the walls let through: band gains for the direct path.
+            let distance = voice.distance.max(0.0);
+            let air_gains: [f32; NUM_BANDS] = if config.air_absorption {
+                std::array::from_fn(|band| air.evaluate(distance, band))
+            } else {
+                [1.0; NUM_BANDS]
+            };
+            let direct = if config.occlusion {
+                acoustics.direct_gains(voice.id)
+            } else {
+                [1.0; NUM_BANDS]
+            };
+            // The reverb hears the source whether or not a wall hides it (sound goes round), through the air.
+            if config.reverb {
+                let send = voice.gain * air_gains[1];
+                for (r, &s) in reverb_in.channel_mut(0).iter_mut().zip(mono.channel(0)) {
+                    *r += s * send;
+                }
+            }
+            let mut eq_gains: [f32; NUM_BANDS] = std::array::from_fn(|b| air_gains[b] * direct[b]);
+            let mut overall = 1.0;
+            EqEffect::normalize_gains(&mut eq_gains, &mut overall);
             match (binaural[i], voice.direction) {
                 (true, Some(direction)) => {
                     let state = states.entry(voice.id).or_insert_with(|| VoiceState {
                         binaural: BinauralEffect::new(settings, hrtf),
                         eq: EqEffect::new(settings),
-                        gain: voice.gain,
+                        gain: voice.gain * overall,
                         frame,
                     });
                     state.frame = frame;
-                    if config.air_absorption {
-                        let distance = voice.distance.max(0.0);
-                        let gains: [f32; NUM_BANDS] =
-                            std::array::from_fn(|band| air.evaluate(distance, band));
-                        state.eq.apply_in_place(&gains, mono);
-                    }
-                    ramp(mono.channel_mut(0), state.gain, voice.gain);
-                    state.gain = voice.gain;
+                    state.eq.apply_in_place(&eq_gains, mono);
+                    let gain = voice.gain * overall;
+                    ramp(mono.channel_mut(0), state.gain, gain);
+                    state.gain = gain;
                     let mut params = BinauralParams::new(Vector3::from_array(direction), hrtf);
                     if config.bilinear {
                         params.interpolation = HrtfInterpolation::Bilinear;
@@ -306,10 +410,9 @@ impl Renderer {
                     }
                 }
                 _ => {
-                    let [left, right] = voice.pan.map(|pan| pan * voice.gain);
-                    if left == 0.0 && right == 0.0 {
-                        continue;
-                    }
+                    // Beyond the binaural budget: Horizon's panning, with the walls' and the air's mean loss.
+                    let loss = eq_gains.iter().sum::<f32>() / NUM_BANDS as f32 * overall;
+                    let [left, right] = voice.pan.map(|pan| pan * voice.gain * loss);
                     for (out, &s) in block.chunks_exact_mut(2).zip(mono.channel(0)) {
                         out[0] += s * left;
                         out[1] += s * right;
@@ -319,6 +422,30 @@ impl Renderer {
         }
         // Sources that stopped, or left the binaural set, drop their state.
         states.retain(|_, state| state.frame == frame);
+
+        // The reverb bus: left and right from two reverbs, faded to the surroundings' level.
+        let target = if config.reverb {
+            acoustics.reverb.wet
+        } else {
+            0.0
+        };
+        if target > 0.0 || *wet > 0.0 {
+            let reverb = Reverb {
+                reverb_times: acoustics.reverb.reverb_times,
+            };
+            for (ear, effect) in reverbs.iter_mut().enumerate() {
+                effect.apply(&reverb, reverb_in, reverb_out);
+                let n = FRAME_SIZE as f32;
+                for (j, (out, &s)) in block
+                    .chunks_exact_mut(2)
+                    .zip(reverb_out.channel(0))
+                    .enumerate()
+                {
+                    out[ear] += s * REVERB_GAIN * (*wet + (target - *wet) * (j as f32 / n));
+                }
+            }
+        }
+        *wet = target;
     }
 }
 
@@ -476,7 +603,7 @@ mod tests {
             })
             .collect();
         let mut position = 0.0;
-        let mut out = vec![0.0; 2 * 4800];
+        let mut out = vec![0.0; 2 * 36_000];
         renderer.begin(1);
         renderer.push(Voice {
             id: 7,
@@ -532,5 +659,91 @@ mod tests {
     #[test]
     fn unsupported_rates_fail_to_load() {
         assert!(Renderer::new(96_000, Config::default()).is_err());
+    }
+
+    use crate::acoustics::{EnvironmentReverb, SourceAcoustics};
+
+    fn renderer_with(sources: &[(u64, SourceAcoustics)], reverb: EnvironmentReverb) -> Renderer {
+        let mut renderer =
+            Renderer::new(48_000, Config::default()).expect("built-in HRTF at 48 kHz");
+        renderer.set_acoustics(Snapshot::fixed(sources.iter().copied().collect(), reverb));
+        renderer
+    }
+
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_reverb_energy_gain() {
+        let settings = AudioSettings::new(48_000, FRAME_SIZE);
+        for time in [0.3f32, 1.0, 3.0] {
+            let mut effect = ReverbEffect::new(&settings, &mut CRand::default());
+            let reverb = Reverb {
+                reverb_times: [time; NUM_BANDS],
+            };
+            let mut seed = 1u32;
+            let mut input = AudioBuffer::new(1, FRAME_SIZE);
+            let mut out = AudioBuffer::new(1, FRAME_SIZE);
+            let (mut e_in, mut e_out) = (0.0f64, 0.0f64);
+            for frame in 0..400 {
+                for s in input.channel_mut(0) {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    *s = seed as f32 / u32::MAX as f32 - 0.5;
+                }
+                effect.apply(&reverb, &input, &mut out);
+                if frame >= 200 {
+                    e_in += input
+                        .channel(0)
+                        .iter()
+                        .map(|s| f64::from(s * s))
+                        .sum::<f64>();
+                    e_out += out.channel(0).iter().map(|s| f64::from(s * s)).sum::<f64>();
+                }
+            }
+            eprintln!("RT {time}: out/in energy {:.5}", e_out / e_in);
+        }
+    }
+
+    #[test]
+    fn a_source_behind_a_wall_is_quieter() {
+        let walled = SourceAcoustics {
+            occlusion: 0.0,
+            transmission: [0.23, 0.11, 0.09],
+        };
+        let mut open = renderer_with(&[], EnvironmentReverb::DRY);
+        let mut hidden = renderer_with(&[(7, walled)], EnvironmentReverb::DRY);
+        let [l0, r0] = ear_energy(&mut open, Some([1.0, 0.0, 0.0]));
+        let [l1, r1] = ear_energy(&mut hidden, Some([1.0, 0.0, 0.0]));
+        let ratio = (l1 + r1) / (l0 + r0);
+        assert!(ratio < 0.1, "behind a wall: {ratio} of the energy");
+        assert!(r1 > l1, "still on the right: left {l1}, right {r1}");
+    }
+
+    #[test]
+    fn an_enclosed_place_leaves_a_reverb_tail() {
+        let cave = EnvironmentReverb {
+            reverb_times: [1.4, 1.1, 0.7],
+            wet: 0.5,
+        };
+        let mut dry = renderer_with(&[], EnvironmentReverb::DRY);
+        let mut wet = renderer_with(&[], cave);
+        let direct = ear_energy(&mut dry, Some([0.0, 0.0, -1.0]));
+        let with_reverb = ear_energy(&mut wet, Some([0.0, 0.0, -1.0]));
+        let added = (with_reverb[0] + with_reverb[1]) / (direct[0] + direct[1]);
+        // The reverb adds to the direct sound without drowning it.
+        assert!(
+            added > 1.05 && added < 3.0,
+            "with reverb: {added} times the energy"
+        );
+        // After the source stops, the tail goes on.
+        let tail = |renderer: &mut Renderer| {
+            let mut out = vec![0.0; 2 * 9600];
+            renderer.begin(1);
+            renderer.render(&mut out, 2, &mut |_, _, _| false);
+            out[2 * 4800..].iter().map(|s| s * s).sum::<f32>()
+        };
+        let (dry_tail, wet_tail) = (tail(&mut dry), tail(&mut wet));
+        assert!(wet_tail > 1e-3, "wet tail {wet_tail}");
+        assert!(dry_tail < 1e-9, "dry tail {dry_tail}");
     }
 }

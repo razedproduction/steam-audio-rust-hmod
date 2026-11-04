@@ -1,18 +1,19 @@
 [mod]
 id = "steam_audio"
-version = "0.1.0"
+version = "0.2.0"
 
 [compatibility]
 # Nightly 2026-11-04 (tag nightly-source/2026-11-04-6475f62).
 horizon_revision = "6475f62f3c834b7489e1816bf47f47ea5eb2b879"
 
-# `crate::audio::steam_audio`: the mod's output stream and its Steam Audio rendering of Horizon's mixer
-# (see the top of output.rs).
+# `horizon_client_render::audio::steam_audio`: the mod's output stream, its Steam Audio rendering of Horizon's
+# mixer and the world's acoustics (see the top of output.rs). Public for the frame hook in horizon-client.
 [[module]]
 id = "output"
 file = "crates/horizon-client-render/src/audio.rs"
 name = "steam_audio"
 source = "output.rs"
+visibility = "pub"
 
 # At each camera update, take the sound output over (once per output Horizon opens).
 [[injection]]
@@ -21,6 +22,15 @@ kind = "HEAD"
 target = "horizon_client_render::audio::Audio::set_listener"
 helper = "listener.rs"
 bindings = [{ name = "audio", ty = "&mut Audio", value = "&mut *self" }]
+
+# Once a frame, the occlusion of the playing sources and the reverb of the camera's surroundings, from the blocks.
+[[injection]]
+id = "acoustics"
+hook = "frame"
+hook_version = 1
+kind = "HEAD"
+helper = "frame.rs"
+bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }]
 
 # steam-audio-rust, vendored, plus the renderer (`steam_audio_hmod::horizon`).
 [[crate]]

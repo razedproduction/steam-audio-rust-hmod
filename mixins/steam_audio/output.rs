@@ -12,6 +12,10 @@
 // Horizon's `mix` fills `Mixer::cameras` and the mod's output leaves it empty, so a filled one means Horizon's
 // stream mixed again: it was reopened (another device, a lost one). The mod then reopens its own on Horizon's
 // device and pauses the new one.
+//
+// The world's acoustics (occlusion, transmission, reverb) need the blocks, which live on the game thread: the mod's
+// `frame` hook in horizon-client calls `update_acoustics` with the world, and the output applies what it publishes.
+// The module is `pub` for that hook.
 
 use super::{Audio, Mixer, State, distance_gain, mix, stereo_gains};
 use steam_audio_hmod::horizon::{Voice, read_linear, with_renderer};
@@ -23,6 +27,125 @@ pub(crate) fn take_over(audio: &mut Audio) {
     output::take_over(audio);
     #[cfg(not(feature = "audio"))]
     let _ = audio;
+}
+
+/// The world's acoustics for the sources playing now, from the blocks around the camera: how much each source is
+/// occluded and what its walls let through, and the reverb of the camera's surroundings. Called by the mod's `frame`
+/// hook in horizon-client, once a frame on the game thread (where the world is); works 20 times a second at most and
+/// publishes its results for the output to apply.
+pub fn update_acoustics(
+    audio: &Audio,
+    world: &crate::world::World,
+    facts: &horizon_items::blocks::BlockFacts,
+) {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+    use steam_audio_hmod::acoustics::{self, Surface};
+
+    // Sources are looked at this often, the surroundings' reverb every other time.
+    const PERIOD: Duration = Duration::from_millis(50);
+    // At most this many sources, the nearest, and none farther than this.
+    const MAX_SOURCES: usize = 32;
+    const MAX_DISTANCE: f64 = 64.0;
+
+    // The game thread's state: when it last worked, and each block state's wall surface (0 unknown, 1 none,
+    // 2 + `Surface` index), for the block facts it was made from.
+    struct Cache {
+        last: Option<Instant>,
+        reverb_turn: bool,
+        facts: usize,
+        surfaces: Vec<u8>,
+        sources: Vec<(u64, [f64; 3])>,
+        results: Vec<(u64, acoustics::SourceAcoustics)>,
+    }
+    thread_local! {
+        static CACHE: RefCell<Cache> = const {
+            RefCell::new(Cache {
+                last: None,
+                reverb_turn: false,
+                facts: 0,
+                surfaces: Vec::new(),
+                sources: Vec::new(),
+                results: Vec::new(),
+            })
+        };
+    }
+
+    let config = steam_audio_hmod::horizon::Config::get();
+    if !config.enabled || audio.backend.owner != 0 || !(config.occlusion || config.reverb) {
+        return;
+    }
+    CACHE.with_borrow_mut(|state| {
+        if state.last.is_some_and(|t| t.elapsed() < PERIOD) {
+            return;
+        }
+        state.last = Some(Instant::now());
+        state.reverb_turn = !state.reverb_turn;
+
+        // The camera and the sources it can hear, the mixer locked only to copy them.
+        let listener = {
+            let Ok(m) = audio.backend.mixer.lock() else {
+                return;
+            };
+            let here = m.worlds.get(&0).copied().unwrap_or_default();
+            let listener = m.listener;
+            state.sources.clear();
+            for (&id, c) in &m.channels {
+                if c.state != State::Playing || c.relative || c.world != here {
+                    continue;
+                }
+                let at = [f64::from(c.at[0]), f64::from(c.at[1]), f64::from(c.at[2])];
+                let d2 = (0..3).map(|i| (at[i] - listener[i]).powi(2)).sum::<f64>();
+                let range = c
+                    .linear
+                    .map_or(MAX_DISTANCE, |max| f64::from(max).min(MAX_DISTANCE));
+                if d2 <= range * range {
+                    state.sources.push((id, at));
+                }
+            }
+            listener
+        };
+        if state.sources.len() > MAX_SOURCES {
+            let d2 = |at: [f64; 3]| (0..3).map(|i| (at[i] - listener[i]).powi(2)).sum::<f64>();
+            state.sources.sort_by(|a, b| d2(a.1).total_cmp(&d2(b.1)));
+            state.sources.truncate(MAX_SOURCES);
+        }
+
+        // Walls: full collision cubes, of the surface their block and sound type say.
+        let key = facts as *const horizon_items::blocks::BlockFacts as usize;
+        if state.facts != key || state.surfaces.len() != facts.states.len() {
+            state.facts = key;
+            state.surfaces.clear();
+            state.surfaces.resize(facts.states.len(), 0);
+        }
+        let surfaces = &mut state.surfaces;
+        let mut wall = |c: [i32; 3]| -> Option<Surface> {
+            let id = world.block(c[0], c[1], c[2]);
+            let slot = surfaces.get_mut(id.0 as usize)?;
+            if *slot == 0 {
+                let f = facts.get(id);
+                *slot = if f.full_collision {
+                    let surface = Surface::classify(&f.name, &f.sounds.break_sound);
+                    2 + Surface::ALL.iter().position(|s| *s == surface).unwrap_or(0) as u8
+                } else {
+                    1
+                };
+            }
+            (*slot >= 2).then(|| Surface::ALL[usize::from(*slot - 2)])
+        };
+
+        let settings = config.acoustics();
+        state.results.clear();
+        if config.occlusion {
+            for &(id, at) in &state.sources {
+                let result = acoustics::source_acoustics(&mut wall, listener, at, &settings);
+                state.results.push((id, result));
+            }
+        }
+        let reverb = (config.reverb && state.reverb_turn)
+            .then(|| acoustics::environment_reverb(&mut wall, listener, &settings));
+        acoustics::publish(&state.results, reverb);
+    });
 }
 
 /// Mixes one output buffer (interleaved, `channels` per frame): with Steam Audio when it can, else as Horizon does.

@@ -8,8 +8,10 @@
 //! - the built-in HRTF is read from `data/cipic_124.hrtf` (generated once from upstream's `cipic_124.inl`)
 //!   instead of being produced by a build script;
 //! - SOFA support is not compiled in;
-//! - [`horizon`] is new: the binaural renderer behind the mod's sound output.
+//! - [`horizon`] and [`acoustics`] are new: the binaural renderer behind the mod's sound output, and the world's
+//!   occlusion, transmission and reverb it applies.
 
+pub mod acoustics;
 pub mod air_absorption;
 pub mod array_math;
 pub mod audio_buffer;
