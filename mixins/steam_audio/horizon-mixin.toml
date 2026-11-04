@@ -1,6 +1,6 @@
 [mod]
 id = "steam_audio"
-version = "0.2.0"
+version = "0.3.0"
 
 [compatibility]
 # Nightly 2026-11-04 (tag nightly-source/2026-11-04-6475f62).
@@ -23,7 +23,8 @@ target = "horizon_client_render::audio::Audio::set_listener"
 helper = "listener.rs"
 bindings = [{ name = "audio", ty = "&mut Audio", value = "&mut *self" }]
 
-# Once a frame, the occlusion of the playing sources and the reverb of the camera's surroundings, from the blocks.
+# Once a frame: the kept settings (first time), the occlusion of the playing sources and the reverb of the camera's
+# surroundings, from the blocks.
 [[injection]]
 id = "acoustics"
 hook = "frame"
@@ -31,6 +32,42 @@ hook_version = 1
 kind = "HEAD"
 helper = "frame.rs"
 bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }]
+
+# The settings page in Options > Mods: the mod's row, its buttons' labels, and their clicks.
+[[injection]]
+id = "mod-row"
+hook = "mods"
+hook_version = 1
+kind = "HEAD"
+helper = "mods.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "mods", ty = "&mut Vec<NativeMod>", value = "&mut *mods" },
+]
+
+[[injection]]
+id = "settings-page"
+hook = "settings"
+hook_version = 1
+kind = "HEAD"
+helper = "settings.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "mod_id", ty = "&str", value = "mod_id" },
+  { name = "buttons", ty = "&mut Vec<String>", value = "&mut *buttons" },
+]
+
+[[injection]]
+id = "settings-click"
+hook = "settings_click"
+hook_version = 1
+kind = "HEAD"
+helper = "settings_click.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "mod_id", ty = "&str", value = "mod_id" },
+  { name = "button", ty = "usize", value = "button" },
+]
 
 # steam-audio-rust, vendored, plus the renderer (`steam_audio_hmod::horizon`).
 [[crate]]

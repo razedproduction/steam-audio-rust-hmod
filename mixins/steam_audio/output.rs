@@ -15,7 +15,8 @@
 //
 // The world's acoustics (occlusion, transmission, reverb) need the blocks, which live on the game thread: the mod's
 // `frame` hook in horizon-client calls `update_acoustics` with the world, and the output applies what it publishes.
-// The module is `pub` for that hook.
+// The module is `pub` for that hook, and for the settings page's hooks (`mods`, `settings`, `settings_click`), which
+// hand over to `steam_audio_hmod::settings`.
 
 use super::{Audio, Mixer, State, distance_gain, mix, stereo_gains};
 use steam_audio_hmod::horizon::{Voice, read_linear, with_renderer};
@@ -27,6 +28,37 @@ pub(crate) fn take_over(audio: &mut Audio) {
     output::take_over(audio);
     #[cfg(not(feature = "audio"))]
     let _ = audio;
+}
+
+/// The mod's id: its row in Options > Mods and its settings folder.
+pub const MOD_ID: &str = steam_audio_hmod::settings::MOD_ID;
+
+/// The mod's row in Options > Mods: id, title and description in the game's `language` (`ru_ru`...). For the `mods`
+/// hook.
+pub fn mod_row(language: &str) -> (String, String, String) {
+    use steam_audio_hmod::settings;
+    (
+        MOD_ID.to_owned(),
+        settings::title(),
+        settings::description(language),
+    )
+}
+
+/// The labels of the mod's settings page, one button per setting with its value. For the `settings` hook.
+pub fn settings_page(language: &str, buttons: &mut Vec<String>) {
+    let config = steam_audio_hmod::horizon::Config::get();
+    buttons.extend(steam_audio_hmod::settings::labels(&config, language));
+}
+
+/// A click on button `button` of the page: the setting moves to its next value, at once, and is kept through
+/// `store` (Horizon's `native_set_setting`). For the `settings_click` hook.
+pub fn settings_click(button: usize, store: &mut dyn FnMut(&str, &str)) {
+    steam_audio_hmod::settings::click_and_store(button, store);
+}
+
+/// Reads the kept settings through `read` (Horizon's `native_setting`), once per game. For the `frame` hook.
+pub fn load_settings(read: &dyn Fn(&str) -> Option<String>) {
+    steam_audio_hmod::settings::load(read);
 }
 
 /// The world's acoustics for the sources playing now, from the blocks around the camera: how much each source is
@@ -71,8 +103,7 @@ pub fn update_acoustics(
         };
     }
 
-    let config = steam_audio_hmod::horizon::Config::get();
-    if !config.enabled || audio.backend.owner != 0 || !(config.occlusion || config.reverb) {
+    if !steam_audio_hmod::horizon::Config::enabled() || audio.backend.owner != 0 {
         return;
     }
     CACHE.with_borrow_mut(|state| {
@@ -81,6 +112,10 @@ pub fn update_acoustics(
         }
         state.last = Some(Instant::now());
         state.reverb_turn = !state.reverb_turn;
+        let config = steam_audio_hmod::horizon::Config::get();
+        if !(config.occlusion || config.reverb) {
+            return;
+        }
 
         // The camera and the sources it can hear, the mixer locked only to copy them.
         let listener = {
@@ -295,7 +330,7 @@ mod output {
 
     pub(super) fn take_over(audio: &mut Audio) {
         // Splitscreen players share the first player's output; no output (none opened, or turned off): nothing.
-        if audio.backend.owner != 0 || audio._stream.is_none() || !Config::get().enabled {
+        if audio.backend.owner != 0 || audio._stream.is_none() || !Config::enabled() {
             return;
         }
         let mixer = audio.backend.mixer.clone();

@@ -15,7 +15,8 @@
 //! Horizon's own `mix`.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use crate::acoustics::{AcousticsSettings, Snapshot};
 use crate::air_absorption::AirAbsorptionModel;
@@ -37,7 +38,9 @@ pub const FRAME_SIZE: usize = 512;
 /// reverb of a 1 s room is as loud as what it was sent, and longer reverbs are louder, as in real rooms.
 const REVERB_GAIN: f32 = 4.0;
 
-/// How the mod renders, from the environment (read once).
+/// How the mod renders: the defaults, then what the player chose on the mod's settings page (Options > Mods,
+/// [`crate::settings`]), then the environment variables below, which win. It can change while the game runs
+/// ([`Config::set`]); the renderer picks a change up at its next output callback.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// `HORIZON_STEAM_AUDIO=0` turns the mod off: Horizon mixes as without it.
@@ -57,7 +60,7 @@ pub struct Config {
     /// `HORIZON_STEAM_AUDIO_OCCLUSION=0` turns occlusion and transmission through blocks off.
     pub occlusion: bool,
     /// `HORIZON_STEAM_AUDIO_WALLS=x` (0 to 1, default 0.35): how much walls muffle; 1 is Steam Audio's physical
-    /// transmission (a stone wall lets through about в€’36 dB), 0 lets everything through.
+    /// transmission (a stone wall lets through about −36 dB), 0 lets everything through.
     pub walls: f32,
     /// `HORIZON_STEAM_AUDIO_REVERB=0` turns the reverb of the surroundings off.
     pub reverb: bool,
@@ -82,47 +85,68 @@ impl Default for Config {
     }
 }
 
+/// A boolean setting's value: `0`, `off`, `false`, `no` are off, `1`, `on`, `true`, `yes` on.
+pub(crate) fn parse_switch(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "off" | "false" | "no" => Some(false),
+        "1" | "on" | "true" | "yes" => Some(true),
+        _ => None,
+    }
+}
+
+/// A number setting's value, finite and clamped into `range`.
+pub(crate) fn parse_number(value: &str, range: std::ops::RangeInclusive<f32>) -> Option<f32> {
+    value
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(*range.start(), *range.end()))
+}
+
 impl Config {
-    /// The configuration `var` describes (`std::env::var` in the game).
+    /// The configuration `var` describes over the defaults (`std::env::var` in the game).
     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
-        let off = |name: &str| {
-            var(name).is_some_and(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "0" | "off" | "false" | "no"
-                )
-            })
+        let mut config = Self::default();
+        config.apply_vars(var);
+        config
+    }
+
+    /// Applies the environment variables `var` has; the others leave their setting as it is.
+    pub fn apply_vars(&mut self, var: impl Fn(&str) -> Option<String>) {
+        let switch = |name: &str, value: &mut bool| {
+            if let Some(v) = var(name).as_deref().and_then(parse_switch) {
+                *value = v;
+            }
         };
-        let default = Self::default();
-        let number = |name: &str, range: std::ops::RangeInclusive<f32>, fallback: f32| {
-            var(name)
-                .and_then(|v| v.trim().parse::<f32>().ok())
-                .filter(|v| v.is_finite())
-                .map_or(fallback, |v| v.clamp(*range.start(), *range.end()))
+        switch("HORIZON_STEAM_AUDIO", &mut self.enabled);
+        switch("HORIZON_STEAM_AUDIO_AIR", &mut self.air_absorption);
+        switch("HORIZON_STEAM_AUDIO_OCCLUSION", &mut self.occlusion);
+        switch("HORIZON_STEAM_AUDIO_REVERB", &mut self.reverb);
+        let number = |name: &str, range: std::ops::RangeInclusive<f32>, value: &mut f32| {
+            if let Some(v) = var(name).and_then(|v| parse_number(&v, range)) {
+                *value = v;
+            }
         };
-        Self {
-            occlusion: !off("HORIZON_STEAM_AUDIO_OCCLUSION"),
-            walls: number("HORIZON_STEAM_AUDIO_WALLS", 0.0..=1.0, default.walls),
-            reverb: !off("HORIZON_STEAM_AUDIO_REVERB"),
-            reverb_level: number(
-                "HORIZON_STEAM_AUDIO_REVERB_LEVEL",
-                0.0..=2.0,
-                default.reverb_level,
-            ),
-            enabled: !off("HORIZON_STEAM_AUDIO"),
-            air_absorption: !off("HORIZON_STEAM_AUDIO_AIR"),
-            bilinear: var("HORIZON_STEAM_AUDIO_INTERPOLATION")
-                .is_some_and(|v| v.trim().eq_ignore_ascii_case("bilinear")),
-            max_binaural_voices: var("HORIZON_STEAM_AUDIO_VOICES")
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(default.max_binaural_voices),
-            volume_db: var("HORIZON_STEAM_AUDIO_VOLUME_DB")
-                .and_then(|v| v.trim().parse::<f32>().ok())
-                .filter(|v| v.is_finite())
-                .map_or(default.volume_db, |v| v.clamp(-24.0, 24.0)),
-            hrtf_path: var("HORIZON_STEAM_AUDIO_HRTF")
-                .filter(|v| !v.trim().is_empty())
-                .map(Into::into),
+        number("HORIZON_STEAM_AUDIO_WALLS", 0.0..=1.0, &mut self.walls);
+        number(
+            "HORIZON_STEAM_AUDIO_REVERB_LEVEL",
+            0.0..=2.0,
+            &mut self.reverb_level,
+        );
+        number(
+            "HORIZON_STEAM_AUDIO_VOLUME_DB",
+            -24.0..=24.0,
+            &mut self.volume_db,
+        );
+        if let Some(v) = var("HORIZON_STEAM_AUDIO_INTERPOLATION") {
+            self.bilinear = v.trim().eq_ignore_ascii_case("bilinear");
+        }
+        if let Some(v) = var("HORIZON_STEAM_AUDIO_VOICES").and_then(|v| v.trim().parse().ok()) {
+            self.max_binaural_voices = v;
+        }
+        if let Some(v) = var("HORIZON_STEAM_AUDIO_HRTF").filter(|v| !v.trim().is_empty()) {
+            self.hrtf_path = Some(v.into());
         }
     }
 
@@ -135,11 +159,44 @@ impl Config {
         }
     }
 
-    /// The game's configuration, from its environment.
-    pub fn get() -> &'static Config {
-        static CONFIG: OnceLock<Config> = OnceLock::new();
-        CONFIG.get_or_init(|| Self::from_vars(|name| std::env::var(name).ok()))
+    /// The game's current configuration (until the settings are loaded, the defaults and the environment).
+    pub fn get() -> Config {
+        live()
+            .read()
+            .map_or_else(|e| e.into_inner().clone(), |c| c.clone())
     }
+
+    /// Whether the mod is on, without copying the configuration (the audio thread asks every callback).
+    pub fn enabled() -> bool {
+        live();
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    /// Makes `config` the game's configuration, from now on.
+    pub fn set(config: Config) {
+        let lock = live();
+        let mut current = lock.write().unwrap_or_else(|e| e.into_inner());
+        ENABLED.store(config.enabled, Ordering::Relaxed);
+        *current = config;
+        VERSION.fetch_add(1, Ordering::Release);
+    }
+
+    /// Bumped by each [`Config::set`].
+    pub fn version() -> u64 {
+        VERSION.load(Ordering::Acquire)
+    }
+}
+
+static ENABLED: AtomicBool = AtomicBool::new(true);
+static VERSION: AtomicU64 = AtomicU64::new(0);
+
+fn live() -> &'static RwLock<Config> {
+    static LIVE: OnceLock<RwLock<Config>> = OnceLock::new();
+    LIVE.get_or_init(|| {
+        let config = Config::from_vars(|name| std::env::var(name).ok());
+        ENABLED.store(config.enabled, Ordering::Relaxed);
+        RwLock::new(config)
+    })
 }
 
 /// One playing source for one output callback.
@@ -206,6 +263,8 @@ pub struct Renderer {
     frame: u64,
     /// The mixer being served (its address): another one starts over.
     owner: usize,
+    /// The [`Config::version`] its configuration is from.
+    config_version: u64,
 }
 
 impl Renderer {
@@ -255,6 +314,7 @@ impl Renderer {
             taken: FRAME_SIZE,
             frame: 0,
             owner: 0,
+            config_version: Config::version(),
             config,
         })
     }
@@ -277,6 +337,21 @@ impl Renderer {
             self.taken = FRAME_SIZE;
         }
         self.voices.clear();
+        // The settings page changed something: take it, but keep the HRTF it was loaded with (its file and volume
+        // come from the environment only).
+        let version = Config::version();
+        if version != self.config_version {
+            self.config_version = version;
+            let mut config = Config::get();
+            config.hrtf_path = self.config.hrtf_path.take();
+            config.volume_db = self.config.volume_db;
+            self.config = config;
+        }
+    }
+
+    /// The configuration it renders with.
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Adds a playing source to this callback.
@@ -505,8 +580,7 @@ static SLOT: Mutex<Slot> = Mutex::new(Slot::Empty);
 /// Runs `f` with the renderer for `rate`, when the mod is on and the HRTF for that rate is loaded. The first call
 /// for a rate starts loading it on a thread of its own and returns `None`, as every call does until it is ready.
 pub fn with_renderer<R>(rate: u32, f: impl FnOnce(&mut Renderer) -> R) -> Option<R> {
-    let config = Config::get();
-    if !config.enabled {
+    if !Config::enabled() {
         return None;
     }
     let mut slot = SLOT.lock().ok()?;
@@ -517,7 +591,7 @@ pub fn with_renderer<R>(rate: u32, f: impl FnOnce(&mut Renderer) -> R) -> Option
     }
     *slot = Slot::Loading(rate);
     drop(slot);
-    let config = config.clone();
+    let config = Config::get();
     let spawned = std::thread::Builder::new()
         .name("steam-audio-hrtf".into())
         .spawn(move || {
@@ -654,6 +728,21 @@ mod tests {
             "left {left}, right {right}"
         );
         assert!(renderer.states.is_empty());
+    }
+
+    #[test]
+    fn the_renderer_takes_settings_changes_at_its_next_callback() {
+        let mut renderer =
+            Renderer::new(48_000, Config::default()).expect("built-in HRTF at 48 kHz");
+        // A change other tests' renderers may also take: harmless to them.
+        Config::set(Config {
+            max_binaural_voices: 31,
+            ..Config::default()
+        });
+        assert_eq!(renderer.config().max_binaural_voices, 32);
+        renderer.begin(1);
+        assert_eq!(renderer.config().max_binaural_voices, 31);
+        assert!(Config::enabled());
     }
 
     #[test]
