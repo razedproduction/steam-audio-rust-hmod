@@ -1,7 +1,7 @@
 [package]
 name = "steam-audio-hmod"
 description = "steam-audio-rust (a Rust port of Valve's Steam Audio) vendored for Horizon, with a binaural renderer for Horizon's mixer"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"

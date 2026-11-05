@@ -8,6 +8,9 @@
 //! - an Ambisonics impulse response ([`Reconstructor`]) of the first [`TRANSITION_TIME`], crossfaded into a parametric
 //!   tail ([`HybridReverbEstimator`]) and partitioned for convolution ([`OverlapSavePartitioner`]).
 //!
+//! Up to [`MAX_SOURCES`] sources near the listener ([`submit_sources`]) are simulated with it, each from where it
+//! is, and get reflections of their own ([`Reflections::sources`]); the others share the listener's.
+//!
 //! The renderer plays them through Steam Audio's [`HybridReverbEffect`](crate::effects::HybridReverbEffect): the
 //! early reflections from where the walls are, rotated with the head and rendered binaurally, the late tail
 //! parametric.
@@ -40,7 +43,7 @@ use crate::simulation::{
 use crate::thread_pool::ThreadPool;
 
 /// Blocks copied around the listener (x, y, z). Rays leaving it escape, as into the open.
-pub const GRID_SIZE: [usize; 3] = [64, 48, 64];
+pub const GRID_SIZE: [usize; 3] = [96, 64, 96];
 /// The grid's corner is snapped to multiples of this, so grids copied while the listener walks about are the same
 /// grid and the simulation keeps refining.
 const GRID_SNAP: i32 = 8;
@@ -68,7 +71,7 @@ const NUM_THREADS: usize = 2;
 const MAX_RUNS: usize = 16;
 /// The listener moving less than this (blocks) is not a change.
 const LISTENER_TOLERANCE: f64 = 0.25;
-/// Shortest time between two simulations.
+/// Shortest time between two simulations (longer when they take long: the thread works at most a quarter of the time).
 pub const MIN_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The blocks around the listener: which cells are walls, and of what. Positions given to its [`RayTracer`] methods
@@ -141,6 +144,32 @@ impl Voxels {
     /// Whether the cell `local` (relative to the corner) is a wall; outside the grid, it is not.
     pub fn is_wall_local(&self, local: [i32; 3]) -> bool {
         self.local_index(local).is_some_and(|i| self.cells[i] != 0)
+    }
+
+    /// `point` (local), or the centre of a free cell next to it if it is inside a wall (a note block, a furnace: a
+    /// sound comes out of its block's sides). `None` if it is walled in.
+    pub fn free_point(&self, point: Vector3) -> Option<Vector3> {
+        let c = [point.x, point.y, point.z].map(|v| v.floor() as i32);
+        if !self.is_wall_local(c) {
+            return Some(point);
+        }
+        [
+            [0, 1, 0],
+            [1, 0, 0],
+            [-1, 0, 0],
+            [0, 0, 1],
+            [0, 0, -1],
+            [0, -1, 0],
+        ]
+        .into_iter()
+        .map(|o: [i32; 3]| -> [i32; 3] { std::array::from_fn(|a| c[a] + o[a]) })
+        .find(|n| !self.is_wall_local(*n))
+        .map(|n| Vector3::new(n[0] as f32 + 0.5, n[1] as f32 + 0.5, n[2] as f32 + 0.5))
+    }
+
+    /// Whether `position` (local) is inside the grid at all.
+    pub fn inside(&self, position: Vector3) -> bool {
+        (0..3).all(|a| position[a] >= 0.0 && position[a] < self.size[a] as f32)
     }
 
     /// Whether `position` (local) is far enough inside the grid to be simulated in.
@@ -268,8 +297,9 @@ impl Voxels {
     }
 }
 
+/// A cell's code: only walls ([`Surface::is_solid`]) are kept; rays go through leaves and fences.
 fn encode(surface: Option<Surface>) -> u8 {
-    surface.map_or(0, |s| {
+    surface.filter(|s| s.is_solid()).map_or(0, |s| {
         1 + Surface::ALL.iter().position(|&x| x == s).unwrap_or(0) as u8
     })
 }
@@ -348,8 +378,25 @@ impl GridBuilder {
     }
 }
 
-/// What the renderer plays: the early reflections' impulse response, ready for convolution, and the parametric
-/// reverb taking over after it.
+/// Most sources simulated with reflections of their own (the nearest, which the game thread picks): their early
+/// reflections come from where they are, not from where the listener is. The other sources share the listener's.
+pub const MAX_SOURCES: usize = 4;
+/// A source moving less than this (blocks) keeps refining its reflections; farther, they start over.
+const SOURCE_TOLERANCE: f64 = 1.0;
+
+/// One set of reflections ready to play: the impulse response of the first [`TRANSITION_TIME`] ([`NUM_CHANNELS`]
+/// Ambisonics channels in world space), ready for convolution, and the parametric reverb taking over after it
+/// (reverb times, level per band, delay in samples).
+#[derive(Debug)]
+pub struct ReverbIr {
+    pub fir: OverlapSaveFir,
+    pub reverb: Reverb,
+    pub eq: [f32; NUM_BANDS],
+    pub delay: usize,
+}
+
+/// What the renderer plays: the listener-centric reverb (`fir`, `reverb`, `eq`, `delay`) for the sources without
+/// reflections of their own, and those of the sources that have them.
 #[derive(Debug)]
 pub struct Reflections {
     /// The sampling rate it was made for.
@@ -360,11 +407,32 @@ pub struct Reflections {
     pub reverb: Reverb,
     pub eq: [f32; NUM_BANDS],
     pub delay: usize,
+    /// The reflections of each source simulated on its own (by mixer channel id), at most [`MAX_SOURCES`].
+    pub sources: Vec<(u64, ReverbIr)>,
+}
+
+impl Reflections {
+    /// Every impulse response it holds, to be reused.
+    pub fn into_firs(self) -> impl Iterator<Item = OverlapSaveFir> {
+        std::iter::once(self.fir).chain(self.sources.into_iter().map(|(_, s)| s.fir))
+    }
 }
 
 /// Samples of impulse response convolved at `rate`.
 pub fn ir_size(rate: u32) -> usize {
     (TRANSITION_TIME * rate as f32).ceil() as usize
+}
+
+/// The energy field of a source simulated on its own, averaged while it and the listener stay put.
+#[derive(Debug)]
+struct SourceState {
+    id: u64,
+    /// Where it was simulated (world).
+    position: [f64; 3],
+    accumulated: EnergyField,
+    runs: usize,
+    ir: ImpulseResponse,
+    estimator: HybridReverbEstimator,
 }
 
 /// Simulates reflections at one sampling rate, synchronously (the thread behind [`submit_grid`] runs one).
@@ -374,7 +442,8 @@ pub struct Simulation {
     frame_size: usize,
     simulator: ReflectionSimulator,
     pool: ThreadPool,
-    field: EnergyField,
+    /// One per simulated source: the listener-centric one first, then [`MAX_SOURCES`].
+    fields: Vec<EnergyField>,
     accumulated: EnergyField,
     runs: usize,
     reconstructor: Reconstructor,
@@ -382,8 +451,9 @@ pub struct Simulation {
     partitioner: OverlapSavePartitioner,
     ir: ImpulseResponse,
     air: AirAbsorptionModel,
-    /// The grid and the listener position (world) the accumulated field is for.
+    /// The grid and the listener position (world) the accumulated fields are for.
     last: Option<(Arc<Voxels>, [f64; 3])>,
+    sources: Vec<SourceState>,
 }
 
 impl Simulation {
@@ -393,7 +463,7 @@ impl Simulation {
             num_diffuse_samples: NUM_DIFFUSE_SAMPLES,
             max_duration: DURATION,
             max_order: ORDER,
-            max_num_sources: 1,
+            max_num_sources: 1 + MAX_SOURCES,
             num_threads: NUM_THREADS,
         };
         Self {
@@ -401,30 +471,46 @@ impl Simulation {
             frame_size,
             simulator: ReflectionSimulator::new(&settings, 5489),
             pool: ThreadPool::new(NUM_THREADS),
-            field: EnergyField::new(DURATION, ORDER),
+            fields: (0..=MAX_SOURCES)
+                .map(|_| EnergyField::new(DURATION, ORDER))
+                .collect(),
             accumulated: EnergyField::new(DURATION, ORDER),
             runs: 0,
             reconstructor: Reconstructor::new(TRANSITION_TIME, rate),
-            estimator: HybridReverbEstimator::new(
-                TRANSITION_TIME,
-                rate,
-                frame_size,
-                &mut CRand::default(),
-            ),
+            estimator: Self::new_estimator(rate, frame_size),
             partitioner: OverlapSavePartitioner::new(frame_size),
             ir: ImpulseResponse::new(TRANSITION_TIME, ORDER, rate),
             air: AirAbsorptionModel::default(),
             last: None,
+            sources: Vec::new(),
         }
+    }
+
+    fn new_estimator(rate: u32, frame_size: usize) -> HybridReverbEstimator {
+        HybridReverbEstimator::new(TRANSITION_TIME, rate, frame_size, &mut CRand::default())
     }
 
     pub fn rate(&self) -> u32 {
         self.rate
     }
 
-    /// Whether a run for `listener` in `grid` would refine the last one (or start over: something changed).
-    pub fn wants(&self, grid: &Arc<Voxels>, listener: [f64; 3]) -> bool {
-        !self.same(grid, listener) || self.runs < MAX_RUNS
+    /// Whether a run for `listener` and `sources` in `grid` would refine the last one (or start over: something
+    /// changed).
+    pub fn wants(
+        &self,
+        grid: &Arc<Voxels>,
+        listener: [f64; 3],
+        sources: &[(u64, [f64; 3])],
+    ) -> bool {
+        if !self.same(grid, listener) || self.runs < MAX_RUNS {
+            return true;
+        }
+        let usable = usable_sources(grid, sources);
+        usable.len() != self.sources.len()
+            || usable
+                .iter()
+                .zip(&self.sources)
+                .any(|(&(id, _, at), state)| !state.matches(id, at) || state.runs < MAX_RUNS)
     }
 
     fn same(&self, grid: &Arc<Voxels>, listener: [f64; 3]) -> bool {
@@ -434,14 +520,15 @@ impl Simulation {
         })
     }
 
-    /// Runs the simulation for `listener` in `grid` and makes the reflections, writing the impulse response into
-    /// `fir` (one of [`ir_size`] samples and [`NUM_CHANNELS`] channels, or a new one if `None`). `None` if the listener
-    /// is not inside the grid.
+    /// Runs the simulation for `listener` in `grid`, and for the `sources` (mixer channel id, world position; at most
+    /// [`MAX_SOURCES`] of those inside the grid are), and makes the reflections. Impulse responses are taken from
+    /// `spare` when it has some of the right size. `None` if the listener is not inside the grid.
     pub fn run(
         &mut self,
         grid: &Arc<Voxels>,
         listener: [f64; 3],
-        fir: Option<OverlapSaveFir>,
+        sources: &[(u64, [f64; 3])],
+        spare: &mut Vec<OverlapSaveFir>,
     ) -> Option<Reflections> {
         let position = grid.to_local(listener);
         if !grid.contains(position) {
@@ -450,11 +537,47 @@ impl Simulation {
         if !self.same(grid, listener) {
             self.runs = 0;
             self.last = Some((Arc::clone(grid), listener));
+            for state in &mut self.sources {
+                state.runs = 0;
+            }
         }
+        // Each source keeps its average while it stays put; new ones start one.
+        let usable = usable_sources(grid, sources);
+        let mut previous = std::mem::take(&mut self.sources);
+        for &(id, _, at) in &usable {
+            let state = match previous.iter().position(|s| s.id == id) {
+                Some(i) => {
+                    let mut state = previous.swap_remove(i);
+                    if !state.matches(id, at) {
+                        state.position = at;
+                        state.runs = 0;
+                    }
+                    state
+                }
+                None => SourceState {
+                    id,
+                    position: at,
+                    accumulated: EnergyField::new(DURATION, ORDER),
+                    runs: 0,
+                    ir: ImpulseResponse::new(TRANSITION_TIME, ORDER, self.rate),
+                    estimator: Self::new_estimator(self.rate, self.frame_size),
+                },
+            };
+            self.sources.push(state);
+        }
+
         let at = CoordinateSpace3::canonical_at(position);
+        let spaces: Vec<CoordinateSpace3> = std::iter::once(at)
+            .chain(
+                usable
+                    .iter()
+                    .map(|&(_, p, _)| CoordinateSpace3::canonical_at(p)),
+            )
+            .collect();
+        let directivities = vec![Directivity::default(); spaces.len()];
         let params = ReflectionSimulationParams {
-            sources: &[at],
-            directivities: &[Directivity::default()],
+            sources: &spaces,
+            directivities: &directivities,
             listener: at,
             num_rays: NUM_RAYS,
             num_bounces: NUM_BOUNCES,
@@ -465,66 +588,153 @@ impl Simulation {
         self.simulator.simulate(
             &**grid,
             &params,
-            std::slice::from_mut(&mut self.field),
+            &mut self.fields[..spaces.len()],
             &self.pool,
         );
         // The average of the runs so far (Steam Audio's accumulation over frames).
-        let n = self.runs as f32;
-        if self.runs == 0 {
-            self.accumulated.copy_from(&self.field);
-        } else {
-            self.accumulated.scale_in_place(n);
-            self.accumulated.add_assign(&self.field);
-            self.accumulated.scale_in_place(1.0 / (n + 1.0));
+        accumulate(&mut self.accumulated, &self.fields[0], &mut self.runs);
+        for (state, field) in self.sources.iter_mut().zip(&self.fields[1..]) {
+            accumulate(&mut state.accumulated, field, &mut state.runs);
         }
-        self.runs = (self.runs + 1).min(MAX_RUNS);
 
-        let reverb = reverb_estimator::estimate(&self.accumulated, &self.air);
-        self.reconstructor.reconstruct(
+        let size = ir_size(self.rate);
+        let blocks = OverlapSaveFir::new(1, size, self.frame_size).num_blocks();
+        let mut take_fir = || {
+            spare
+                .iter()
+                .position(|f| f.num_channels() == NUM_CHANNELS && f.num_blocks() == blocks)
+                .map(|i| spare.swap_remove(i))
+                .unwrap_or_else(|| OverlapSaveFir::new(NUM_CHANNELS, size, self.frame_size))
+        };
+        let mut make = |field: &EnergyField,
+                        ir: &mut ImpulseResponse,
+                        estimator: &mut HybridReverbEstimator,
+                        fir: OverlapSaveFir| {
+            make_ir(
+                &mut self.reconstructor,
+                &mut self.partitioner,
+                &self.air,
+                field,
+                ir,
+                estimator,
+                fir,
+            )
+        };
+        let listener_ir = make(
             &self.accumulated,
             &mut self.ir,
-            &ReconstructionParams {
-                kind: ReconstructionType::Linear,
-                duration: TRANSITION_TIME,
-                order: ORDER,
-                air_absorption: &self.air,
-                distance_attenuation_correction: None,
-            },
+            &mut self.estimator,
+            take_fir(),
         );
-        let estimate = self.estimator.estimate(
-            Some(&self.accumulated),
-            &reverb,
-            &mut self.ir,
-            TRANSITION_TIME,
-            OVERLAP_FRACTION,
-            ORDER,
-        );
-        let size = ir_size(self.rate);
-        let mut fir = fir
-            .filter(|f| {
-                f.num_channels() == NUM_CHANNELS
-                    && f.num_blocks() == OverlapSaveFir::new(1, size, self.frame_size).num_blocks()
+        let sources = self
+            .sources
+            .iter_mut()
+            .map(|s| {
+                let ir = make(&s.accumulated, &mut s.ir, &mut s.estimator, take_fir());
+                (s.id, ir)
             })
-            .unwrap_or_else(|| OverlapSaveFir::new(NUM_CHANNELS, size, self.frame_size));
-        self.partitioner
-            .partition(&self.ir, NUM_CHANNELS, self.ir.num_samples(), &mut fir);
+            .collect();
         Some(Reflections {
             rate: self.rate,
-            fir,
-            reverb,
-            eq: estimate.eq_coeffs,
-            delay: estimate.delay,
+            fir: listener_ir.fir,
+            reverb: listener_ir.reverb,
+            eq: listener_ir.eq,
+            delay: listener_ir.delay,
+            sources,
         })
     }
 
-    /// The impulse response of the last run (channel 0 is the omnidirectional one).
+    /// The listener-centric impulse response of the last run (channel 0 is the omnidirectional one).
     pub fn impulse_response(&self) -> &ImpulseResponse {
         &self.ir
     }
 
-    /// The energy field averaged over the runs so far.
+    /// The listener-centric energy field averaged over the runs so far.
     pub fn energy_field(&self) -> &EnergyField {
         &self.accumulated
+    }
+
+    /// The energy field of source `id` averaged over the runs so far, if it is simulated on its own.
+    pub fn source_energy_field(&self, id: u64) -> Option<&EnergyField> {
+        self.sources
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| &s.accumulated)
+    }
+}
+
+impl SourceState {
+    fn matches(&self, id: u64, at: [f64; 3]) -> bool {
+        self.id == id && (0..3).all(|a| (self.position[a] - at[a]).abs() < SOURCE_TOLERANCE)
+    }
+}
+
+/// The first [`MAX_SOURCES`] of `sources` inside the grid, with their local position (out of their block if they are
+/// in one) and world position.
+fn usable_sources(grid: &Voxels, sources: &[(u64, [f64; 3])]) -> Vec<(u64, Vector3, [f64; 3])> {
+    sources
+        .iter()
+        .filter_map(|&(id, at)| {
+            let local = grid.to_local(at);
+            if !grid.inside(local) {
+                return None;
+            }
+            Some((id, grid.free_point(local)?, at))
+        })
+        .take(MAX_SOURCES)
+        .collect()
+}
+
+/// Adds `field` to the average `accumulated` of `runs` runs.
+fn accumulate(accumulated: &mut EnergyField, field: &EnergyField, runs: &mut usize) {
+    let n = *runs as f32;
+    if *runs == 0 {
+        accumulated.copy_from(field);
+    } else {
+        accumulated.scale_in_place(n);
+        accumulated.add_assign(field);
+        accumulated.scale_in_place(1.0 / (n + 1.0));
+    }
+    *runs = (*runs + 1).min(MAX_RUNS);
+}
+
+/// From an energy field: the reverb times, the impulse response of the first [`TRANSITION_TIME`] crossfaded into the
+/// parametric reverb, partitioned into `fir`.
+fn make_ir(
+    reconstructor: &mut Reconstructor,
+    partitioner: &mut OverlapSavePartitioner,
+    air: &AirAbsorptionModel,
+    field: &EnergyField,
+    ir: &mut ImpulseResponse,
+    estimator: &mut HybridReverbEstimator,
+    mut fir: OverlapSaveFir,
+) -> ReverbIr {
+    let reverb = reverb_estimator::estimate(field, air);
+    reconstructor.reconstruct(
+        field,
+        ir,
+        &ReconstructionParams {
+            kind: ReconstructionType::Linear,
+            duration: TRANSITION_TIME,
+            order: ORDER,
+            air_absorption: air,
+            distance_attenuation_correction: None,
+        },
+    );
+    let estimate = estimator.estimate(
+        Some(field),
+        &reverb,
+        ir,
+        TRANSITION_TIME,
+        OVERLAP_FRACTION,
+        ORDER,
+    );
+    partitioner.partition(ir, NUM_CHANNELS, ir.num_samples(), &mut fir);
+    ReverbIr {
+        fir,
+        reverb,
+        eq: estimate.eq_coeffs,
+        delay: estimate.delay,
     }
 }
 
@@ -536,6 +746,7 @@ impl Simulation {
 struct Request {
     grid: Option<Arc<Voxels>>,
     listener: Option<[f64; 3]>,
+    sources: Vec<(u64, [f64; 3])>,
 }
 
 static REQUEST: LazyLock<(Mutex<Request>, Condvar)> =
@@ -544,6 +755,8 @@ static REQUEST: LazyLock<(Mutex<Request>, Condvar)> =
 static OUTPUT: Mutex<Option<Box<Reflections>>> = Mutex::new(None);
 /// Impulse responses the audio thread is done with, for the next runs to reuse.
 static SPARE: Mutex<Vec<OverlapSaveFir>> = Mutex::new(Vec::new());
+/// Most impulse responses kept for reuse: two runs' worth.
+const MAX_SPARE: usize = 2 * (1 + MAX_SOURCES);
 /// The renderer's sampling rate (0 until there is one).
 static RATE: AtomicU32 = AtomicU32::new(0);
 /// The renderer's frame size.
@@ -576,6 +789,23 @@ pub fn submit_listener(listener: [f64; 3]) {
     }
 }
 
+/// Tells the simulation which sources to simulate on their own (game thread): mixer channel id and world position,
+/// the most important first; at most [`MAX_SOURCES`] of them are.
+pub fn submit_sources(sources: &[(u64, [f64; 3])]) {
+    let (lock, signal) = &*REQUEST;
+    if let Ok(mut request) = lock.lock() {
+        let changed = request.sources.len() != sources.len()
+            || request.sources.iter().zip(sources).any(|(a, b)| {
+                a.0 != b.0 || (0..3).any(|i| (a.1[i] - b.1[i]).abs() >= SOURCE_TOLERANCE)
+            });
+        request.sources.clear();
+        request.sources.extend_from_slice(sources);
+        if changed {
+            signal.notify_one();
+        }
+    }
+}
+
 /// The renderer's sampling rate and frame size, which the reflections are made for (audio thread; never waits).
 pub fn set_rate(rate: u32, frame_size: usize) {
     FRAME_SIZE.store(frame_size as u32, Ordering::Relaxed);
@@ -590,7 +820,7 @@ pub fn take() -> Option<Box<Reflections>> {
 /// Hands back an impulse response the audio thread is done with (never waits; dropped if the lock is busy).
 pub fn recycle(fir: OverlapSaveFir) {
     if let Ok(mut spare) = SPARE.try_lock()
-        && spare.len() < 2
+        && spare.len() < MAX_SPARE
     {
         spare.push(fir);
     }
@@ -609,16 +839,19 @@ fn start() {
 
 fn run_thread() {
     let mut simulation: Option<Simulation> = None;
-    let mut last_run: Option<Instant> = None;
+    let mut last_run: Option<(Instant, Duration)> = None;
+    let mut spare = Vec::new();
     loop {
-        if let Some(t) = last_run {
+        // At least `MIN_INTERVAL` between runs, and the thread busy at most a quarter of the time.
+        if let Some((t, took)) = last_run {
+            let wait = MIN_INTERVAL.max(took * 3);
             let elapsed = t.elapsed();
-            if elapsed < MIN_INTERVAL {
-                std::thread::sleep(MIN_INTERVAL - elapsed);
+            if elapsed < wait {
+                std::thread::sleep(wait - elapsed);
             }
         }
         // Wait for a grid and a listener the simulation would do something with.
-        let (grid, listener, rate) = {
+        let (grid, listener, sources, rate) = {
             let (lock, signal) = &*REQUEST;
             let Ok(mut request) = lock.lock() else {
                 return;
@@ -627,11 +860,11 @@ fn run_thread() {
                 let rate = RATE.load(Ordering::Relaxed);
                 if rate != 0
                     && let (Some(grid), Some(listener)) = (&request.grid, request.listener)
-                    && simulation
-                        .as_ref()
-                        .is_none_or(|s| s.rate() != rate || s.wants(grid, listener))
+                    && simulation.as_ref().is_none_or(|s| {
+                        s.rate() != rate || s.wants(grid, listener, &request.sources)
+                    })
                 {
-                    break (Arc::clone(grid), listener, rate);
+                    break (Arc::clone(grid), listener, request.sources.clone(), rate);
                 }
                 match signal.wait_timeout(request, Duration::from_millis(500)) {
                     Ok((r, _)) => request = r,
@@ -644,18 +877,21 @@ fn run_thread() {
             Some(s) if s.rate() == rate => s,
             other => other.insert(Simulation::new(rate, frame_size)),
         };
-        last_run = Some(Instant::now());
-        let fir = SPARE.lock().ok().and_then(|mut spare| spare.pop());
+        let started = Instant::now();
+        if let Ok(mut s) = SPARE.lock() {
+            spare.append(&mut s);
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            simulation.run(&grid, listener, fir)
+            simulation.run(&grid, listener, &sources, &mut spare)
         }));
+        last_run = Some((started, started.elapsed()));
         match result {
             Ok(Some(reflections)) => {
                 if let Ok(mut output) = OUTPUT.lock()
                     && let Some(old) = output.replace(Box::new(reflections))
                 {
                     drop(output);
-                    recycle(old.fir);
+                    spare.extend(old.into_firs());
                 }
             }
             Ok(None) => {}
@@ -664,6 +900,7 @@ fn run_thread() {
                 return;
             }
         }
+        spare.truncate(MAX_SPARE);
     }
 }
 
@@ -751,7 +988,7 @@ mod tests {
         let mut simulation = Simulation::new(48_000, 512);
         let mut last = None;
         for _ in 0..4 {
-            last = simulation.run(grid, listener, None);
+            last = simulation.run(grid, listener, &[], &mut Vec::new());
         }
         let reflections = last.expect("inside the grid");
         let energy = simulation
@@ -831,16 +1068,81 @@ mod tests {
         let listener = [0.5, 65.6, 0.5];
         let g = grid(listener, room([4, 5, 4], Surface::Rock));
         let mut simulation = Simulation::new(48_000, 512);
-        assert!(simulation.run(&g, [500.0, 65.0, 0.0], None).is_none());
-        assert!(simulation.run(&g, listener, None).is_some());
-        assert!(simulation.wants(&g, listener));
+        assert!(
+            simulation
+                .run(&g, [500.0, 65.0, 0.0], &[], &mut Vec::new())
+                .is_none()
+        );
+        assert!(simulation.run(&g, listener, &[], &mut Vec::new()).is_some());
+        assert!(simulation.wants(&g, listener, &[]));
         for _ in 0..MAX_RUNS {
-            simulation.run(&g, listener, None);
+            simulation.run(&g, listener, &[], &mut Vec::new());
         }
-        assert!(!simulation.wants(&g, listener));
-        assert!(simulation.wants(&g, [2.0, 65.6, 0.5]));
+        assert!(!simulation.wants(&g, listener, &[]));
+        assert!(simulation.wants(&g, [2.0, 65.6, 0.5], &[]));
     }
 
+    #[test]
+    fn a_big_cave_rings_longer_than_a_smaller_one() {
+        // 81 blocks across: larger than the grid of 0.4.0 (64), inside this one.
+        let listener = [0.5, 65.6, 0.5];
+        let (big, _, _) = simulate(&grid(listener, room([40, 20, 40], Surface::Rock)), listener);
+        let (smaller, _, _) =
+            simulate(&grid(listener, room([16, 20, 16], Surface::Rock)), listener);
+        assert!(
+            big.reverb_times[1] > 1.2 * smaller.reverb_times[1],
+            "{big:?} {smaller:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_are_not_walls_in_the_grid() {
+        let voxels = Voxels::from_fn([0, 0, 0], [4, 4, 4], |c| {
+            (c[0] == 1).then_some(Surface::Foliage)
+        });
+        assert_eq!(voxels.surface([1, 1, 1]), None);
+        let water = Voxels::from_fn([0, 0, 0], [4, 4, 4], |c| {
+            (c[1] == 0).then_some(Surface::Water)
+        });
+        assert_eq!(water.surface([1, 0, 1]), Some(Surface::Water));
+    }
+    #[test]
+    fn sources_get_reflections_of_their_own() {
+        let listener = [0.5, 65.6, 0.5];
+        let g = grid(listener, room([6, 5, 6], Surface::Rock));
+        let mut simulation = Simulation::new(48_000, 512);
+        // A source in the cave, one inside a wall of it (heard from the free cell beside it), one outside the grid.
+        let sources = [
+            (7, [4.5, 64.5, 0.5]),
+            (8, [7.5, 65.5, 0.5]),
+            (9, [900.5, 65.5, 0.5]),
+        ];
+        let reflections = simulation
+            .run(&g, listener, &sources, &mut Vec::new())
+            .expect("inside the grid");
+        let ids: Vec<u64> = reflections.sources.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, [7, 8]);
+        let energy = |field: &EnergyField| {
+            (0..NUM_BANDS)
+                .map(|b| field.band(0, b).iter().sum::<f32>())
+                .sum::<f32>()
+        };
+        let own = energy(simulation.source_energy_field(7).expect("simulated"));
+        assert!(own > 0.0, "{own}");
+        // Staying put refines, moving starts over, a new set of sources is a change.
+        for _ in 0..MAX_RUNS {
+            simulation.run(&g, listener, &sources, &mut Vec::new());
+        }
+        assert!(!simulation.wants(&g, listener, &sources));
+        assert!(!simulation.wants(&g, listener, &[(7, [4.9, 64.5, 0.5]), sources[1]]));
+        assert!(simulation.wants(&g, listener, &[(7, [1.5, 64.5, 0.5]), sources[1]]));
+        assert!(simulation.wants(&g, listener, &sources[..1]));
+        // The impulse responses are reused.
+        let mut spare: Vec<OverlapSaveFir> = reflections.into_firs().collect();
+        assert_eq!(spare.len(), 3);
+        simulation.run(&g, listener, &sources, &mut spare);
+        assert!(spare.is_empty());
+    }
     #[test]
     #[ignore = "measurement"]
     fn measure_simulation_time() {
@@ -856,9 +1158,21 @@ mod tests {
             let mut simulation = Simulation::new(48_000, 512);
             let started = Instant::now();
             for _ in 0..8 {
-                simulation.run(&g, listener, None);
+                simulation.run(&g, listener, &[], &mut Vec::new());
             }
             eprintln!("{name}: {:?} per run", started.elapsed() / 8);
+            let sources: Vec<(u64, [f64; 3])> = (0..MAX_SOURCES as u64)
+                .map(|i| (i, [listener[0] + 2.0 + i as f64, 64.5, listener[2] - 1.0]))
+                .collect();
+            let started = Instant::now();
+            for _ in 0..8 {
+                simulation.run(&g, listener, &sources, &mut Vec::new());
+            }
+            eprintln!(
+                "{name}: {:?} per run with {} sources of their own",
+                started.elapsed() / 8,
+                sources.len()
+            );
             let at = CoordinateSpace3::canonical_at(g.to_local(listener));
             let params = ReflectionSimulationParams {
                 sources: &[at],
@@ -875,7 +1189,7 @@ mod tests {
                 simulation.simulator.simulate(
                     &*g,
                     &params,
-                    std::slice::from_mut(&mut simulation.field),
+                    &mut simulation.fields[..1],
                     &simulation.pool,
                 );
             }

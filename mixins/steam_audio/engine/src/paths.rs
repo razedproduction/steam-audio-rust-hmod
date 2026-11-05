@@ -39,13 +39,13 @@ pub const HEIGHT: f32 = 1.5;
 /// Radius of a probe's influence: the probes around a point are those within it.
 const INFLUENCE: f32 = 1.5 * SPACING as f32;
 /// Most probes baked: the bake keeps a path for every pair of them.
-pub const MAX_PROBES: usize = 512;
+pub const MAX_PROBES: usize = 768;
 /// Probes farther apart than this are not joined directly (blocks).
-pub const VIS_RANGE: f32 = 20.0;
+pub const VIS_RANGE: f32 = 16.0;
 /// Paths longer than this are not baked (blocks).
 const PATH_RANGE: f32 = 96.0;
 const NUM_THREADS: usize = 2;
-/// Shortest time between two bakes.
+/// Shortest time between two bakes (longer when they take long: the thread works at most a quarter of the time).
 pub const MIN_INTERVAL: Duration = Duration::from_millis(500);
 /// The order-0 spherical harmonic: the simulator's one SH coefficient is this times the paths' total weight.
 const Y00: f32 = 0.282_094_8;
@@ -95,23 +95,31 @@ fn identifier() -> BakedDataIdentifier {
     }
 }
 
-/// Where probes stand in `grid` (local coordinates), [`HEIGHT`] above floors (a wall with two free cells over it):
-/// every [`SPACING`] blocks, and in the doorways between them (a floor between two walls, open on the other axis),
-/// which the regular probes would miss. At most [`MAX_PROBES`], the nearest to `center`.
+/// Where probes stand in `grid` (local coordinates), [`HEIGHT`] above floors (a wall with two free cells over it) or
+/// in the middle of a one-block gap (crawl spaces, windows): every [`SPACING`] blocks, and in the doorways between
+/// them (a floor between two walls, open on the other axis), which the regular probes would miss. At most
+/// [`MAX_PROBES`], the nearest to `center`.
 pub fn probe_points(grid: &Voxels, center: Vector3) -> Vec<Vector3> {
     let size = grid.size().map(|s| s as i32);
     let wall = |x: i32, y: i32, z: i32| grid.is_wall_local([x, y, z]);
-    let floor = |x: i32, y: i32, z: i32| wall(x, y, z) && !wall(x, y + 1, z) && !wall(x, y + 2, z);
+    // A probe over the wall at (x, y, z): `HEIGHT` above it with two free cells over it, or in the middle of a
+    // single free cell under another wall (a crawl space, a window in a wall).
     let point = |x: i32, y: i32, z: i32| {
-        Vector3::new(x as f32 + 0.5, (y + 1) as f32 + HEIGHT, z as f32 + 0.5)
+        if !wall(x, y, z) || wall(x, y + 1, z) {
+            return None;
+        }
+        let height = if wall(x, y + 2, z) { 0.5 } else { HEIGHT };
+        Some(Vector3::new(
+            x as f32 + 0.5,
+            (y + 1) as f32 + height,
+            z as f32 + 0.5,
+        ))
     };
     let mut points = Vec::new();
     for x in (SPACING / 2..size[0]).step_by(SPACING as usize) {
         for z in (SPACING / 2..size[2]).step_by(SPACING as usize) {
             for y in 0..size[1] - 2 {
-                if floor(x, y, z) {
-                    points.push(point(x, y, z));
-                }
+                points.extend(point(x, y, z));
             }
         }
     }
@@ -122,9 +130,9 @@ pub fn probe_points(grid: &Voxels, center: Vector3) -> Vec<Vector3> {
     for x in 1..size[0] - 1 {
         for z in 1..size[2] - 1 {
             for y in 0..size[1] - 2 {
-                if !floor(x, y, z) {
+                let Some(p) = point(x, y, z) else {
                     continue;
-                }
+                };
                 let f = y + 1;
                 let walled_x = wall(x - 1, f, z) && wall(x + 1, f, z);
                 let walled_z = wall(x, f, z - 1) && wall(x, f, z + 1);
@@ -133,7 +141,6 @@ pub fn probe_points(grid: &Voxels, center: Vector3) -> Vec<Vector3> {
                 if !((walled_x && open_z) || (walled_z && open_x)) {
                     continue;
                 }
-                let p = point(x, y, z);
                 if points[regular..]
                     .iter()
                     .all(|q: &Vector3| (*q - p).length_squared() >= MIN_GAP * MIN_GAP)
@@ -222,8 +229,8 @@ impl Paths {
     /// (the caller asks for occluded sources). `None` when there is none: either is outside the grid or sees no
     /// probe, or no baked path joins their probes.
     pub fn find(&self, listener: [f64; 3], source: [f64; 3]) -> Option<PathAcoustics> {
-        let listener = self.free_point(self.grid.to_local(listener))?;
-        let source = self.free_point(self.grid.to_local(source))?;
+        let listener = self.grid.free_point(self.grid.to_local(listener))?;
+        let source = self.grid.free_point(self.grid.to_local(source))?;
         let batches = [&self.batch];
         let around = |point: Vector3| {
             let mut probes = ProbeNeighborhood::default();
@@ -276,28 +283,6 @@ impl Paths {
             distance: (straight / ratio).max(straight),
         })
     }
-
-    /// `point`, or the centre of a free cell next to it if it is inside a wall (a note block, a furnace: a sound
-    /// comes out of its block's sides). `None` if it is walled in.
-    fn free_point(&self, point: Vector3) -> Option<Vector3> {
-        let cell = |p: Vector3| [p.x, p.y, p.z].map(|v| v.floor() as i32);
-        let c = cell(point);
-        if !self.grid.is_wall_local(c) {
-            return Some(point);
-        }
-        [
-            [0, 1, 0],
-            [1, 0, 0],
-            [-1, 0, 0],
-            [0, 0, 1],
-            [0, 0, -1],
-            [0, -1, 0],
-        ]
-        .into_iter()
-        .map(|o: [i32; 3]| std::array::from_fn(|a| c[a] + o[a]))
-        .find(|n| !self.grid.is_wall_local(*n))
-        .map(|n: [i32; 3]| Vector3::new(n[0] as f32 + 0.5, n[1] as f32 + 0.5, n[2] as f32 + 0.5))
-    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -342,12 +327,14 @@ fn start() {
 fn run_thread() {
     let pool = ThreadPool::new(NUM_THREADS);
     let mut baked: Option<Arc<Voxels>> = None;
-    let mut last_run: Option<Instant> = None;
+    let mut last_run: Option<(Instant, Duration)> = None;
     loop {
-        if let Some(t) = last_run {
+        // At least `MIN_INTERVAL` between bakes, and the thread busy at most a quarter of the time.
+        if let Some((t, took)) = last_run {
+            let wait = MIN_INTERVAL.max(took * 3);
             let elapsed = t.elapsed();
-            if elapsed < MIN_INTERVAL {
-                std::thread::sleep(MIN_INTERVAL - elapsed);
+            if elapsed < wait {
+                std::thread::sleep(wait - elapsed);
             }
         }
         let grid = {
@@ -369,10 +356,11 @@ fn run_thread() {
                 }
             }
         };
-        last_run = Some(Instant::now());
+        let started = Instant::now();
         baked = Some(Arc::clone(&grid));
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Paths::bake(grid, &pool)));
+        last_run = Some((started, started.elapsed()));
         match result {
             Ok(paths) => {
                 if let Ok(mut latest) = LATEST.lock() {
@@ -432,7 +420,8 @@ mod tests {
         let flat = grid(listener, |c| (c[1] < 64).then_some(Surface::Gravel));
         let center = Vector3::from_array(GRID_SIZE.map(|s| s as f32 / 2.0));
         let points = probe_points(&flat, center);
-        assert_eq!(points.len(), 16 * 16);
+        let columns = |s: usize| s.div_ceil(SPACING as usize);
+        assert_eq!(points.len(), columns(GRID_SIZE[0]) * columns(GRID_SIZE[2]));
         let y = flat.to_local([0.0, 64.0 + f64::from(HEIGHT), 0.0]).y;
         assert!(
             points.iter().all(|p| (p.y - y).abs() < 1e-4),
@@ -469,6 +458,36 @@ mod tests {
         assert!(sealed.find(listener, source).is_none());
     }
 
+    #[test]
+    fn a_window_and_a_crawl_space_join_the_rooms() {
+        let listener = [-4.5, 65.6, 0.5];
+        let source = [4.5, 64.5, 0.5];
+        let pool = ThreadPool::new(2);
+        // A one-block window in the wall between the rooms, a block above the floor.
+        let mut sealed = two_rooms(None);
+        let window = grid(
+            listener,
+            move |c| {
+                if c == [0, 65, -3] { None } else { sealed(c) }
+            },
+        );
+        let paths = Paths::bake(window, &pool).expect("probes");
+        assert!(paths.find(listener, source).is_some(), "through the window");
+        // A crawl space under the wall: a trench one block deep across it.
+        let mut sealed = two_rooms(None);
+        let crawl = grid(listener, move |c| {
+            if c[1] == 63 && c[2] == -3 && (-1..=1).contains(&c[0]) {
+                None
+            } else {
+                sealed(c)
+            }
+        });
+        let paths = Paths::bake(crawl, &pool).expect("probes");
+        assert!(
+            paths.find(listener, source).is_some(),
+            "through the crawl space"
+        );
+    }
     #[test]
     fn a_source_inside_its_block_is_heard_from_the_block_beside_it() {
         let listener = [-4.5, 65.6, 0.5];

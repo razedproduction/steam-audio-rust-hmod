@@ -87,8 +87,10 @@ pub fn update_acoustics(
     // At most this many sources, the nearest, and none farther than this.
     const MAX_SOURCES: usize = 32;
     const MAX_DISTANCE: f64 = 64.0;
-    // Blocks copied for the reverb per frame (a whole grid is 196 608).
-    const GRID_BUDGET: usize = 12_288;
+    // Sources this near get reflections of their own (the nearest `reflections::MAX_SOURCES`).
+    const OWN_REFLECTIONS_DISTANCE: f64 = 32.0;
+    // Blocks copied for the reverb and the paths per frame (a whole grid is 589 824: 24 frames).
+    const GRID_BUDGET: usize = 24_576;
 
     // The game thread's state: when it last looked, what it found then (the settings, the camera), each block state's
     // wall surface (0 unknown, 1 none, 2 + `Surface` index) for the block facts it was made from, and the grid being
@@ -144,7 +146,7 @@ pub fn update_acoustics(
                 let here = m.worlds.get(&0).copied().unwrap_or_default();
                 let listener = m.listener;
                 state.listener = Some(listener);
-                if config.occlusion {
+                {
                     for (&id, c) in &m.channels {
                         if c.state != State::Playing || c.relative || c.world != here {
                             continue;
@@ -176,7 +178,8 @@ pub fn update_acoustics(
             state.sources.truncate(MAX_SOURCES);
         }
 
-        // Walls: full collision cubes, of the surface their block and sound type say.
+        // Walls: full collision cubes, of the surface their block and sound type say; and what is not a full cube
+        // but counts (liquids, slabs and stairs, leaves, fences and panes: `Surface::classify_partial`).
         let key = facts as *const horizon_items::blocks::BlockFacts as usize;
         if state.facts != key || state.surfaces.len() != facts.states.len() {
             state.facts = key;
@@ -189,21 +192,36 @@ pub fn update_acoustics(
             let slot = surfaces.get_mut(id.0 as usize)?;
             if *slot == 0 {
                 let f = facts.get(id);
-                *slot = if f.full_collision {
-                    let surface = Surface::classify(&f.name, &f.sounds.break_sound);
-                    2 + Surface::ALL.iter().position(|s| *s == surface).unwrap_or(0) as u8
+                let surface = if f.full_collision {
+                    Some(Surface::classify(&f.name, &f.sounds.break_sound))
                 } else {
-                    1
+                    Surface::classify_partial(&f.name, &f.sounds.break_sound)
                 };
+                *slot = surface.map_or(1, |surface| {
+                    2 + Surface::ALL.iter().position(|s| *s == surface).unwrap_or(0) as u8
+                });
             }
             (*slot >= 2).then(|| Surface::ALL[usize::from(*slot - 2)])
         };
 
         if let Some(settings) = settings {
             state.results.clear();
+            // The nearest sources get reflections simulated from where they are.
+            if state.reverb {
+                let mut nearest: Vec<(u64, [f64; 3])> = state
+                    .sources
+                    .iter()
+                    .filter(|(_, at, _)| d2(*at) <= OWN_REFLECTIONS_DISTANCE.powi(2))
+                    .map(|(id, at, _)| (*id, *at))
+                    .collect();
+                nearest.sort_by(|a, b| d2(a.1).total_cmp(&d2(b.1)).then(a.0.cmp(&b.0)));
+                nearest.truncate(reflections::MAX_SOURCES);
+                reflections::submit_sources(&nearest);
+            }
             // The paths baked in the blocks around the camera, for the sources a wall hides.
             let baked = if state.pathing { paths::latest() } else { None };
-            for (id, at, attenuation) in &state.sources {
+            let occluding = if state.occlusion { &state.sources[..] } else { &[] };
+            for (id, at, attenuation) in occluding {
                 let mut result = acoustics::source_acoustics(&mut wall, listener, *at, &settings);
                 if result.occlusion < 1.0
                     && let Some(baked) = &baked
@@ -326,6 +344,11 @@ fn render_binaural(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u
                 direction: (distance > 0.05).then_some([x, y, -ahead]),
                 distance,
                 step: f64::from(*source_rate) / f64::from(rate) * f64::from(c.pitch.max(0.0)),
+                source_gain: if c.relative || c.world == world {
+                    c.gain.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
             });
         }
         let sources = &mut mixer.channels;

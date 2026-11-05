@@ -32,7 +32,7 @@ use crate::hrtf::{
 };
 use crate::math::{CoordinateSpace3, Vector3};
 use crate::random::CRand;
-use crate::reflections::{self, Reflections};
+use crate::reflections::{self, Reflections, ReverbIr};
 use crate::simulation::Reverb;
 use crate::speaker_layout::{SpeakerLayout, SpeakerLayoutType};
 
@@ -41,7 +41,7 @@ pub const FRAME_SIZE: usize = 512;
 
 /// The simulated reflections are physical: energy coming back to the listener from a source at the listener, relative
 /// to the direct sound 1 m from it. Horizon's sources are quieter with distance than that (linear, not 1/r), so the
-/// reverb is brought up by this gain: at a reverb level of 1, a 9 Г— 5 Г— 9 stone cave's reverb is about as loud as the
+/// reverb is brought up by this gain: at a reverb level of 1, a 9 × 5 × 9 stone cave's reverb is about as loud as the
 /// sound sent to it (measured by `measure_reverb_level`).
 const REFLECTIONS_GAIN: f32 = 1.4;
 
@@ -67,7 +67,7 @@ pub struct Config {
     /// `HORIZON_STEAM_AUDIO_OCCLUSION=0` turns occlusion and transmission through blocks off.
     pub occlusion: bool,
     /// `HORIZON_STEAM_AUDIO_WALLS=x` (0 to 1, default 0.35): how much walls muffle; 1 is Steam Audio's physical
-    /// transmission (a stone wall lets through about в€’36 dB), 0 lets everything through.
+    /// transmission (a stone wall lets through about −36 dB), 0 lets everything through.
     pub walls: f32,
     /// `HORIZON_STEAM_AUDIO_PATHING=0` turns the sound paths around walls off (with occlusion on, a hidden source
     /// is then heard through the wall only).
@@ -225,6 +225,9 @@ pub struct Voice {
     pub distance: f32,
     /// Source samples per output sample (sampling rate ratio times pitch).
     pub step: f64,
+    /// The source's gain without distance attenuation (0 when no camera hears it): what it sends to reflections
+    /// simulated from where it is, which attenuate with distance themselves.
+    pub source_gain: f32,
 }
 
 /// What a source's samples are, for [`Renderer::render`]: fills `out` with the source's mono samples resampled at
@@ -243,6 +246,43 @@ struct VoiceState {
     frame: u64,
     /// The way round the walls hiding it, while there is one or its sound fades out.
     path: Option<PathVoice>,
+}
+
+/// A source with reflections of its own ([`reflections::MAX_SOURCES`] of the nearest): Steam Audio's hybrid reverb of
+/// them, fed with the source alone.
+#[derive(Debug)]
+struct SourceReverb {
+    effect: HybridReverbEffect,
+    input: AudioBuffer,
+    /// The reflections being played (reverb times, parametric level per band, delay) and new ones not played yet.
+    playing: Option<(Reverb, [f32; NUM_BANDS], usize)>,
+    pending: Option<ReverbIr>,
+    state: AudioEffectState,
+    /// Whether the latest reflections have it (it sends to them, not to the listener's).
+    own: bool,
+    /// Whether it sent something this frame.
+    sent: bool,
+}
+
+impl SourceReverb {
+    fn new(settings: &AudioSettings, rate: u32) -> Self {
+        Self {
+            effect: HybridReverbEffect::new(
+                settings,
+                &OverlapSaveConvolutionSettings {
+                    num_channels: reflections::NUM_CHANNELS,
+                    ir_size: reflections::ir_size(rate),
+                },
+                &mut CRand::default(),
+            ),
+            input: AudioBuffer::new(1, FRAME_SIZE),
+            playing: None,
+            pending: None,
+            state: AudioEffectState::TailComplete,
+            own: false,
+            sent: false,
+        }
+    }
 }
 
 /// The sound of a source coming round what hides it ([`crate::paths`]): a second binaural voice, from where the
@@ -286,10 +326,15 @@ pub struct Renderer {
     hybrid: HybridReverbEffect,
     decode: AmbisonicsDecodeEffect,
     reverb_state: AudioEffectState,
+    /// The sources with reflections of their own (by mixer channel id), and where their reverbs are summed.
+    source_reverbs: HashMap<u64, SourceReverb>,
+    source_ambisonics: AudioBuffer,
     wet: f32,
     /// The reflections being played (reverb times, parametric level per band, delay) and new ones not played yet.
     reflections: Option<(Reverb, [f32; NUM_BANDS], usize)>,
     pending: Option<Box<Reflections>>,
+    /// Reflections given with [`Renderer::set_reflections`], taken at the next frame as published ones are.
+    incoming: Option<Box<Reflections>>,
     /// The listener's orientation in the world.
     orientation: CoordinateSpace3,
     /// The current frame, interleaved stereo, and how many of its frames the callbacks took.
@@ -350,9 +395,12 @@ impl Renderer {
             hybrid,
             decode,
             reverb_state: AudioEffectState::TailComplete,
+            source_reverbs: HashMap::new(),
+            source_ambisonics: AudioBuffer::new(reflections::NUM_CHANNELS, FRAME_SIZE),
             wet: 0.0,
             reflections: None,
             pending: None,
+            incoming: None,
             orientation: CoordinateSpace3::default(),
             air: AirAbsorptionModel::default(),
             states: HashMap::new(),
@@ -384,7 +432,7 @@ impl Renderer {
 
     /// Plays `reflections` from the next frame on (normally what the reflection simulation publishes).
     pub fn set_reflections(&mut self, reflections: Box<Reflections>) {
-        self.pending = Some(reflections);
+        self.incoming = Some(reflections);
     }
 
     /// The listener's orientation: where it looks and its up, in the world (unit vectors, perpendicular). The
@@ -488,15 +536,22 @@ impl Renderer {
             hybrid,
             decode,
             reverb_state,
+            source_reverbs,
+            source_ambisonics,
             wet,
             reflections: playing_reflections,
             pending,
+            incoming,
             orientation,
             rate,
             block,
             ..
         } = self;
         reverb_in.make_silent();
+        for r in source_reverbs.values_mut() {
+            r.input.make_silent();
+            r.sent = false;
+        }
         for (i, voice) in voices.iter().enumerate() {
             if !playing[i] {
                 continue;
@@ -525,10 +580,18 @@ impl Renderer {
             } else {
                 [1.0; NUM_BANDS]
             };
-            // The reverb hears the source whether or not a wall hides it (sound goes round), through the air.
+            // The reverb hears the source whether or not a wall hides it (sound goes round), through the air: its own
+            // reflections if it has some (simulated from where it is, with the air and the distance), else the
+            // listener's.
             if config.reverb {
-                let send = voice.gain * air_gains[1];
-                for (r, &s) in reverb_in.channel_mut(0).iter_mut().zip(mono.channel(0)) {
+                let (input, send) = match source_reverbs.get_mut(&voice.id).filter(|r| r.own) {
+                    Some(r) => {
+                        r.sent = true;
+                        (&mut r.input, voice.source_gain)
+                    }
+                    None => (&mut *reverb_in, voice.gain * air_gains[1]),
+                };
+                for (r, &s) in input.channel_mut(0).iter_mut().zip(mono.channel(0)) {
                     *r += s * send;
                 }
             }
@@ -649,16 +712,40 @@ impl Renderer {
             0.0
         };
         if pending.is_none()
-            && let Some(new) = reflections::take()
+            && let Some(mut new) = incoming.take().or_else(reflections::take)
         {
             if new.rate == *rate {
+                // The sources' reflections go to their own reverbs; the others' are left to ring out.
+                for r in source_reverbs.values_mut() {
+                    r.own = false;
+                }
+                for (id, ir) in new.sources.drain(..) {
+                    let r = source_reverbs
+                        .entry(id)
+                        .or_insert_with(|| SourceReverb::new(settings, *rate));
+                    r.own = true;
+                    if let Some(old) = r.pending.replace(ir) {
+                        reflections::recycle(old.fir);
+                    }
+                }
                 *pending = Some(new);
             } else {
-                reflections::recycle(new.fir);
+                for fir in new.into_firs() {
+                    reflections::recycle(fir);
+                }
             }
         }
-        if target > 0.0 || *wet > 0.0 || *reverb_state == AudioEffectState::TailRemaining {
+        let sources_ring = source_reverbs
+            .values()
+            .any(|r| r.sent || r.state == AudioEffectState::TailRemaining);
+        if target > 0.0
+            || *wet > 0.0
+            || *reverb_state == AudioEffectState::TailRemaining
+            || sources_ring
+        {
             ramp(reverb_in.channel_mut(0), *wet, target);
+            ambisonics.make_silent();
+            let mut any = false;
             let mut update = pending.take();
             if let Some(new) = &update {
                 *playing_reflections = Some((new.reverb, new.eq, new.delay));
@@ -679,6 +766,54 @@ impl Renderer {
                     reverb_in,
                     ambisonics,
                 );
+                any = true;
+            }
+            // The effect handed back the impulse response it played until now.
+            if let Some(old) = update {
+                reflections::recycle(old.fir);
+            }
+            // The sources' own reverbs, summed into the same Ambisonics.
+            for r in source_reverbs.values_mut() {
+                if !(r.sent || r.state == AudioEffectState::TailRemaining) {
+                    continue;
+                }
+                ramp(r.input.channel_mut(0), *wet, target);
+                let mut update = r.pending.take();
+                if let Some(new) = &update {
+                    r.playing = Some((new.reverb, new.eq, new.delay));
+                }
+                if let Some((reverb, eq, delay)) = r.playing.as_ref() {
+                    let ir = match &mut update {
+                        Some(new) => HybridReverbIr::Updated(&mut new.fir),
+                        None => HybridReverbIr::Current,
+                    };
+                    r.state = r.effect.apply(
+                        HybridReverbParams {
+                            ir,
+                            num_channels: reflections::NUM_CHANNELS,
+                            reverb,
+                            eq_coeffs: eq,
+                            delay: *delay,
+                        },
+                        &r.input,
+                        source_ambisonics,
+                    );
+                    for ch in 0..reflections::NUM_CHANNELS {
+                        for (a, &s) in ambisonics
+                            .channel_mut(ch)
+                            .iter_mut()
+                            .zip(source_ambisonics.channel(ch))
+                        {
+                            *a += s;
+                        }
+                    }
+                    any = true;
+                }
+                if let Some(old) = update {
+                    reflections::recycle(old.fir);
+                }
+            }
+            if any {
                 decode.apply(
                     AmbisonicsDecodeParams {
                         order: reflections::ORDER,
@@ -694,11 +829,15 @@ impl Renderer {
                     out[1] += reverb_out.channel(1)[j];
                 }
             }
-            // The effect handed back the impulse response it played until now.
-            if let Some(old) = update {
+        }
+        // A source's reverb goes once it has no reflections of its own and has rung out.
+        source_reverbs.retain(|_, r| {
+            let keep = r.own || r.sent || r.state == AudioEffectState::TailRemaining;
+            if !keep && let Some(old) = r.pending.take() {
                 reflections::recycle(old.fir);
             }
-        }
+            keep
+        });
         *wet = target;
     }
 }
@@ -865,6 +1004,7 @@ mod tests {
             direction,
             distance: 4.0,
             step: 1.0,
+            source_gain: 0.5,
         });
         renderer.render(&mut out, 2, &mut |id, step, buf| {
             assert_eq!(id, 7);
@@ -932,7 +1072,7 @@ mod tests {
     use crate::acoustics::{SourceAcoustics, Surface};
     use crate::effects::{OverlapSaveFir, OverlapSavePartitioner};
     use crate::paths::PathAcoustics;
-    use crate::reflections::{GRID_SIZE, GridBuilder, NUM_CHANNELS, Simulation, Voxels};
+    use crate::reflections::{GRID_SIZE, GridBuilder, NUM_CHANNELS, ReverbIr, Simulation, Voxels};
     use crate::simulation::ImpulseResponse;
     use std::sync::Arc;
 
@@ -957,7 +1097,7 @@ mod tests {
         let mut simulation = Simulation::new(48_000, FRAME_SIZE);
         let mut last = None;
         for _ in 0..4 {
-            last = simulation.run(&grid, listener, None);
+            last = simulation.run(&grid, listener, &[], &mut Vec::new());
         }
         Box::new(last.expect("the listener is inside the grid"))
     }
@@ -987,7 +1127,37 @@ mod tests {
             },
             eq: [0.0; NUM_BANDS],
             delay: size,
+            sources: Vec::new(),
         })
+    }
+
+    #[test]
+    fn a_source_with_reflections_of_its_own_is_heard_in_them() {
+        // The listener's reflections come from the west, source 7's own from the east (looking north).
+        let mut renderer = renderer_with(&[]);
+        let mut both = reflections_from([-1.0, 0.0, 0.0]);
+        let own = reflections_from([1.0, 0.0, 0.0]);
+        both.sources.push((
+            7,
+            ReverbIr {
+                fir: own.fir,
+                reverb: own.reverb,
+                eq: own.eq,
+                delay: own.delay,
+            },
+        ));
+        renderer.set_reflections(both);
+        // The reflections are taken at the first frame; the source sends to its own from then on.
+        ear_energy(&mut renderer, Some([0.0, 0.0, -1.0]));
+        assert!(renderer.source_reverbs.get(&7).is_some_and(|r| r.own));
+        let [l, r] = tail(&mut renderer, 0);
+        assert!(r > 2.0 * l, "from the east: left {l}, right {r}");
+        // Without them, the same source is heard in the listener's (from the west).
+        let mut shared = renderer_with(&[]);
+        shared.set_reflections(reflections_from([-1.0, 0.0, 0.0]));
+        ear_energy(&mut shared, Some([0.0, 0.0, -1.0]));
+        let [l, r] = tail(&mut shared, 0);
+        assert!(l > 2.0 * r, "from the west: left {l}, right {r}");
     }
 
     /// Renders 0.2 s with no source playing and returns the energy of each ear over the last `from` frames on.
@@ -1008,6 +1178,7 @@ mod tests {
         let walled = SourceAcoustics {
             occlusion: 0.0,
             transmission: [0.23, 0.11, 0.09],
+            through: [1.0; NUM_BANDS],
             path: None,
         };
         let mut open = renderer_with(&[]);
@@ -1025,6 +1196,7 @@ mod tests {
         let walled = SourceAcoustics {
             occlusion: 0.0,
             transmission: [0.23, 0.11, 0.09],
+            through: [1.0; NUM_BANDS],
             path: Some(PathAcoustics {
                 direction: [-1.0, 0.0, 0.0],
                 gain: 0.8,
