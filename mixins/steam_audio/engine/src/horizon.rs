@@ -76,6 +76,55 @@ pub struct Config {
     pub reverb: bool,
     /// `HORIZON_STEAM_AUDIO_REVERB_LEVEL=x` (0 to 2, default 0.5): reverb level in a fully enclosed place.
     pub reverb_level: f32,
+    /// `HORIZON_STEAM_AUDIO_UNDERWATER=0`: the world sounds the same with the head under water (by default it is
+    /// muffled, and water no longer counts as a wall around the listener).
+    pub underwater: bool,
+    /// `HORIZON_STEAM_AUDIO_DISTANCE=vanilla`: Horizon's linear distance attenuation, silent at the sound's range
+    /// (16 blocks for a mob). By default it is physical ([`distance_gain`]): a mob is heard across a large cave.
+    pub physical_distance: bool,
+}
+
+/// How far a sound with Horizon's range `linear` is heard with physical attenuation: four times its range.
+pub const PHYSICAL_RANGE: f32 = 4.0;
+
+/// The distance attenuation of a source with Horizon's `linear` range (`None`: not attenuated) at `distance`.
+///
+/// Horizon's (`physical == false`) is OpenAL's linear model, `1 − d / range`, silent at the range. The physical one
+/// is Steam Audio's inverse distance, `r₀ / d`, with the reference distance `r₀` a quarter of the range: full
+/// volume up close, the same as Horizon's at half the range, a quarter (−12 dB) at the range instead of silence,
+/// and fading out smoothly over the last quarter before [`PHYSICAL_RANGE`] ranges.
+pub fn distance_gain(linear: Option<f32>, distance: f32, physical: bool) -> f32 {
+    let Some(range) = linear else {
+        return 1.0;
+    };
+    if range <= 0.0 {
+        return 0.0;
+    }
+    if !physical {
+        return (1.0 - distance.min(range) / range).clamp(0.0, 1.0);
+    }
+    let reference = (range / 4.0).max(1.0);
+    let inverse = (reference / distance.max(1e-3)).min(1.0);
+    let end = range * PHYSICAL_RANGE;
+    let fade_from = end * 0.75;
+    let fade = if distance <= fade_from {
+        1.0
+    } else {
+        let t = ((distance - fade_from) / (end - fade_from)).clamp(0.0, 1.0);
+        1.0 - t * t * (3.0 - 2.0 * t)
+    };
+    inverse * fade
+}
+
+/// How far a source with Horizon's range `linear` can be heard (`None`: everywhere).
+pub fn audible_range(linear: Option<f32>, physical: bool) -> Option<f32> {
+    linear.map(|range| {
+        if physical {
+            range * PHYSICAL_RANGE
+        } else {
+            range
+        }
+    })
 }
 
 impl Default for Config {
@@ -92,6 +141,8 @@ impl Default for Config {
             pathing: true,
             reverb: true,
             reverb_level: 0.5,
+            underwater: true,
+            physical_distance: true,
         }
     }
 }
@@ -135,6 +186,7 @@ impl Config {
         switch("HORIZON_STEAM_AUDIO_OCCLUSION", &mut self.occlusion);
         switch("HORIZON_STEAM_AUDIO_PATHING", &mut self.pathing);
         switch("HORIZON_STEAM_AUDIO_REVERB", &mut self.reverb);
+        switch("HORIZON_STEAM_AUDIO_UNDERWATER", &mut self.underwater);
         let number = |name: &str, range: std::ops::RangeInclusive<f32>, value: &mut f32| {
             if let Some(v) = var(name).and_then(|v| parse_number(&v, range)) {
                 *value = v;
@@ -151,6 +203,9 @@ impl Config {
             -24.0..=24.0,
             &mut self.volume_db,
         );
+        if let Some(v) = var("HORIZON_STEAM_AUDIO_DISTANCE") {
+            self.physical_distance = !v.trim().eq_ignore_ascii_case("vanilla");
+        }
         if let Some(v) = var("HORIZON_STEAM_AUDIO_INTERPOLATION") {
             self.bilinear = v.trim().eq_ignore_ascii_case("bilinear");
         }
@@ -337,6 +392,8 @@ pub struct Renderer {
     incoming: Option<Box<Reflections>>,
     /// The listener's orientation in the world.
     orientation: CoordinateSpace3,
+    /// How far under water the listener sounds (0 dry, 1 under), moving towards what is published over a few frames.
+    underwater: f32,
     /// The current frame, interleaved stereo, and how many of its frames the callbacks took.
     block: Vec<f32>,
     taken: usize,
@@ -402,6 +459,7 @@ impl Renderer {
             pending: None,
             incoming: None,
             orientation: CoordinateSpace3::default(),
+            underwater: 0.0,
             air: AirAbsorptionModel::default(),
             states: HashMap::new(),
             voices: Vec::new(),
@@ -543,10 +601,26 @@ impl Renderer {
             pending,
             incoming,
             orientation,
+            underwater,
             rate,
             block,
             ..
         } = self;
+        // Under water: every sound of the world loses its highs on the way in (the direct sound, the way round, what
+        // goes to the reverb). The change takes about five frames (50 ms).
+        let target = if config.underwater && acoustics.underwater {
+            1.0
+        } else {
+            0.0
+        };
+        *underwater += (target - *underwater) * 0.35;
+        if (*underwater - target).abs() < 1e-3 {
+            *underwater = target;
+        }
+        let medium: [f32; NUM_BANDS] = std::array::from_fn(|b| {
+            1.0 - *underwater * (1.0 - crate::acoustics::UNDERWATER_GAINS[b])
+        });
+        let medium_send = medium.iter().sum::<f32>() / NUM_BANDS as f32;
         reverb_in.make_silent();
         for r in source_reverbs.values_mut() {
             r.input.make_silent();
@@ -587,15 +661,16 @@ impl Renderer {
                 let (input, send) = match source_reverbs.get_mut(&voice.id).filter(|r| r.own) {
                     Some(r) => {
                         r.sent = true;
-                        (&mut r.input, voice.source_gain)
+                        (&mut r.input, voice.source_gain * medium_send)
                     }
-                    None => (&mut *reverb_in, voice.gain * air_gains[1]),
+                    None => (&mut *reverb_in, voice.gain * air_gains[1] * medium_send),
                 };
                 for (r, &s) in input.channel_mut(0).iter_mut().zip(mono.channel(0)) {
                     *r += s * send;
                 }
             }
-            let mut eq_gains: [f32; NUM_BANDS] = std::array::from_fn(|b| air_gains[b] * direct[b]);
+            let mut eq_gains: [f32; NUM_BANDS] =
+                std::array::from_fn(|b| air_gains[b] * direct[b] * medium[b]);
             let mut overall = 1.0;
             EqEffect::normalize_gains(&mut eq_gains, &mut overall);
             // The way round the walls, for the hidden part of the source: band gains (the bends, and the air along
@@ -611,7 +686,7 @@ impl Renderer {
                             } else {
                                 1.0
                             };
-                            air * p.eq[b]
+                            air * p.eq[b] * medium[b]
                         });
                         let mut overall = 1.0;
                         EqEffect::normalize_gains(&mut eq, &mut overall);
@@ -1160,6 +1235,96 @@ mod tests {
         assert!(l > 2.0 * r, "from the west: left {l}, right {r}");
     }
 
+    #[test]
+    fn physical_distance_attenuation_reaches_past_the_range() {
+        let mob = Some(16.0);
+        // Horizon's: silent at the range.
+        assert_eq!(distance_gain(mob, 16.0, false), 0.0);
+        assert!((distance_gain(mob, 8.0, false) - 0.5).abs() < 1e-6);
+        // Physical: full up close, the same at half the range, then a long tail fading out at four ranges.
+        assert_eq!(distance_gain(mob, 2.0, true), 1.0);
+        assert!((distance_gain(mob, 8.0, true) - 0.5).abs() < 1e-6);
+        assert!((distance_gain(mob, 16.0, true) - 0.25).abs() < 1e-6);
+        assert!((distance_gain(mob, 32.0, true) - 0.125).abs() < 1e-6);
+        let tail: Vec<f32> = (40..=64)
+            .map(|d| distance_gain(mob, d as f32, true))
+            .collect();
+        assert!(tail.windows(2).all(|w| w[1] <= w[0]), "{tail:?}");
+        assert_eq!(distance_gain(mob, 64.0, true), 0.0);
+        assert_eq!(distance_gain(None, 100.0, true), 1.0);
+        assert_eq!(audible_range(mob, true), Some(64.0));
+        assert_eq!(audible_range(mob, false), Some(16.0));
+    }
+
+    /// The audio thread's load: 32 voices for a second of sound, with the listener's reverb only and with
+    /// `own` sources having reflections of their own. Prints the share of real time the rendering takes.
+    fn audio_load(own: usize) -> f64 {
+        let mut renderer = renderer_with(&[]);
+        let mut reflections = reflections_from([-1.0, 0.0, 0.0]);
+        for id in 0..own as u64 {
+            let r = reflections_from([1.0, 0.0, 0.0]);
+            reflections.sources.push((
+                id,
+                ReverbIr {
+                    fir: r.fir,
+                    reverb: r.reverb,
+                    eq: r.eq,
+                    delay: r.delay,
+                },
+            ));
+        }
+        renderer.set_reflections(reflections);
+        let tone: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.05).sin() * 0.1).collect();
+        let mut positions = [0.0f64; 32];
+        let mut out = vec![0.0; 2 * 480];
+        let push = |renderer: &mut Renderer| {
+            renderer.begin(1);
+            for id in 0..32u64 {
+                let a = id as f32 * 0.4;
+                renderer.push(Voice {
+                    id,
+                    gain: 0.3,
+                    pan: [0.5, 0.5],
+                    direction: Some([a.sin(), 0.0, -a.cos()]),
+                    distance: 4.0 + id as f32,
+                    step: 1.0,
+                    source_gain: 0.3,
+                });
+            }
+        };
+        // Warm up (the reflections are taken at the first frame), then a second of 10 ms callbacks.
+        for _ in 0..10 {
+            push(&mut renderer);
+            renderer.render(&mut out, 2, &mut |id, step, buf| {
+                let p = &mut positions[id as usize];
+                *p = read_linear(&tone, *p, step, true, buf).0;
+                true
+            });
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            push(&mut renderer);
+            renderer.render(&mut out, 2, &mut |id, step, buf| {
+                let p = &mut positions[id as usize];
+                *p = read_linear(&tone, *p, step, true, buf).0;
+                true
+            });
+        }
+        start.elapsed().as_secs_f64()
+    }
+
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_audio_load() {
+        for own in [0, 1, 2] {
+            let load = audio_load(own);
+            println!(
+                "32 voices, {own} sources with their own reflections: {:.1}% of a core",
+                load * 100.0
+            );
+        }
+    }
+
     /// Renders 0.2 s with no source playing and returns the energy of each ear over the last `from` frames on.
     fn tail(renderer: &mut Renderer, from: usize) -> [f32; 2] {
         let mut out = vec![0.0; 2 * 9600];
@@ -1188,6 +1353,35 @@ mod tests {
         let ratio = (l1 + r1) / (l0 + r0);
         assert!(ratio < 0.1, "behind a wall: {ratio} of the energy");
         assert!(r1 > l1, "still on the right: left {l1}, right {r1}");
+    }
+
+    #[test]
+    fn under_water_the_world_is_muffled_unless_turned_off() {
+        let mut dry = renderer_with(&[]);
+        let under = |config: Config| {
+            let mut renderer = renderer_with(&[]);
+            renderer.config = config;
+            renderer.config_version = Config::version();
+            let mut snapshot = Snapshot::fixed(HashMap::new());
+            snapshot.underwater = true;
+            renderer.set_acoustics(snapshot);
+            renderer
+        };
+        let mut wet = under(Config::default());
+        let mut off = under(Config {
+            underwater: false,
+            ..Config::default()
+        });
+        let [l0, r0] = ear_energy(&mut dry, Some([1.0, 0.0, 0.0]));
+        let [l1, r1] = ear_energy(&mut wet, Some([1.0, 0.0, 0.0]));
+        let [l2, r2] = ear_energy(&mut off, Some([1.0, 0.0, 0.0]));
+        let ratio = (l1 + r1) / (l0 + r0);
+        assert!(
+            ratio < 0.5 && ratio > 0.01,
+            "under water: {ratio} of the energy"
+        );
+        assert!(r1 > l1, "still on the right: left {l1}, right {r1}");
+        assert!(((l2 + r2) / (l0 + r0) - 1.0).abs() < 0.01);
     }
 
     #[test]

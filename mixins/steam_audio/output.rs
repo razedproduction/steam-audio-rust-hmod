@@ -18,8 +18,8 @@
 // The module is `pub` for that hook, and for the settings page's hooks (`mods`, `settings`, `settings_click`), which
 // hand over to `steam_audio_hmod::settings`.
 
-use super::{Audio, Mixer, State, distance_gain, mix, stereo_gains};
-use steam_audio_hmod::horizon::{Voice, read_linear, with_renderer};
+use super::{Audio, Mixer, State, mix, stereo_gains};
+use steam_audio_hmod::horizon::{Voice, audible_range, distance_gain, read_linear, with_renderer};
 
 /// Takes Horizon's sound output over, once per output Horizon opens. Called on the game thread at every camera
 /// update; without the `audio` feature there is no output and it does nothing.
@@ -87,25 +87,49 @@ pub fn update_acoustics(
     // At most this many sources, the nearest, and none farther than this.
     const MAX_SOURCES: usize = 32;
     const MAX_DISTANCE: f64 = 64.0;
-    // Sources this near get reflections of their own (the nearest `reflections::MAX_SOURCES`).
+    // Sources this near get reflections of their own (the nearest `reflections::MAX_SOURCES`), once they have played
+    // this long: a footstep or a hit is over before its reflections could be simulated, and new sounds coming all the
+    // time would keep the simulation from ever settling.
     const OWN_REFLECTIONS_DISTANCE: f64 = 32.0;
-    // Blocks copied for the reverb and the paths per frame (a whole grid is 589 824: 24 frames).
+    const OWN_REFLECTIONS_AGE: Duration = Duration::from_secs(1);
+    // Blocks copied for the reverb and the paths per frame (a whole grid is 589 824), in slices, for at most
+    // `GRID_TIME`: a grid around a new place in 24 frames or more. Once the grid around the camera is there, it is
+    // copied again only to see blocks change, `GRID_REFRESH` a frame (about 1.5 s for all of it at 100 fps).
     const GRID_BUDGET: usize = 24_576;
+    const GRID_SLICE: usize = 2_048;
+    const GRID_TIME: Duration = Duration::from_micros(1_500);
+    const GRID_REFRESH: usize = 4_096;
 
-    // The game thread's state: when it last looked, what it found then (the settings, the camera), each block state's
-    // wall surface (0 unknown, 1 none, 2 + `Surface` index) for the block facts it was made from, and the grid being
-    // copied.
+    // What a block state is to the sound: its wall surface, if any; its shape when it is a wall but not a full cube
+    // (a slab, a door: rays pass beside it), and the axes along which that shape closes its cell; whether it is a full
+    // wall; whether it holds water.
+    #[derive(Clone)]
+    struct Block {
+        surface: Option<Surface>,
+        shape: Option<acoustics::Shape>,
+        seals: u8,
+        full: bool,
+        water: bool,
+    }
+
+    // The game thread's state: when it last looked, what it found then (the settings, the camera), what each block
+    // state is (`None` until asked) for the block facts it was made from, and the grid being copied.
     struct Cache {
         last: Option<Instant>,
         occlusion: bool,
         pathing: bool,
         reverb: bool,
+        underwater: bool,
         listener: Option<[f64; 3]>,
         facts: usize,
-        surfaces: Vec<u8>,
+        blocks: Vec<Option<Block>>,
         sources: Vec<(u64, [f64; 3], Attenuation)>,
         results: Vec<(u64, acoustics::SourceAcoustics)>,
+        // Since when each source has been playing (by mixer channel id).
+        playing_since: Vec<(u64, Instant)>,
         grid: GridBuilder,
+        // Where the last complete grid was (its corner).
+        grid_origin: Option<[i32; 3]>,
     }
     thread_local! {
         static CACHE: RefCell<Cache> = const {
@@ -114,12 +138,15 @@ pub fn update_acoustics(
                 occlusion: false,
                 pathing: false,
                 reverb: false,
+                underwater: false,
                 listener: None,
                 facts: 0,
-                surfaces: Vec::new(),
+                blocks: Vec::new(),
                 sources: Vec::new(),
                 results: Vec::new(),
+                playing_since: Vec::new(),
                 grid: GridBuilder::new(),
+                grid_origin: None,
             })
         };
     }
@@ -136,73 +163,129 @@ pub fn update_acoustics(
             state.occlusion = config.occlusion;
             state.pathing = config.occlusion && config.pathing;
             state.reverb = config.reverb;
+            state.underwater = config.underwater;
             settings = Some(config.acoustics());
             state.sources.clear();
             // The camera and the sources it can hear, the mixer locked only to copy them.
-            if config.occlusion || config.reverb {
+            if config.occlusion || config.reverb || config.underwater {
                 let Ok(m) = audio.backend.mixer.lock() else {
                     return;
                 };
                 let here = m.worlds.get(&0).copied().unwrap_or_default();
                 let listener = m.listener;
                 state.listener = Some(listener);
-                {
+                if config.occlusion || config.reverb {
                     for (&id, c) in &m.channels {
                         if c.state != State::Playing || c.relative || c.world != here {
                             continue;
                         }
                         let at = [f64::from(c.at[0]), f64::from(c.at[1]), f64::from(c.at[2])];
                         let d2 = (0..3).map(|i| (at[i] - listener[i]).powi(2)).sum::<f64>();
-                        let range = c
-                            .linear
+                        let range = audible_range(c.linear, config.physical_distance)
                             .map_or(MAX_DISTANCE, |max| f64::from(max).min(MAX_DISTANCE));
                         if d2 <= range * range {
-                            let linear = c.linear;
+                            let (linear, physical) = (c.linear, config.physical_distance);
                             let attenuation: Attenuation =
-                                Box::new(move |d| distance_gain(linear, d));
+                                Box::new(move |d| distance_gain(linear, d, physical));
                             state.sources.push((id, at, attenuation));
                         }
                     }
                 }
             }
-        }
-        if !(state.occlusion || state.reverb) {
-            return;
+            let now = Instant::now();
+            let sources = &state.sources;
+            state
+                .playing_since
+                .retain(|(id, _)| sources.iter().any(|s| s.0 == *id));
+            for (id, _, _) in sources {
+                if !state.playing_since.iter().any(|p| p.0 == *id) {
+                    state.playing_since.push((*id, now));
+                }
+            }
         }
         let Some(listener) = state.listener else {
             return;
         };
+
+        // Walls: full collision cubes, of the surface their block and sound type say; and what is not a full cube
+        // but counts (liquids, slabs and stairs, doors, leaves, fences and panes: `Surface::classify_partial`), with
+        // the shape of its state.
+        let key = facts as *const horizon_items::blocks::BlockFacts as usize;
+        if state.facts != key || state.blocks.len() != facts.states.len() {
+            state.facts = key;
+            state.blocks.clear();
+            state.blocks.resize(facts.states.len(), None);
+        }
+        let blocks = RefCell::new(std::mem::take(&mut state.blocks));
+        let block = |c: [i32; 3]| -> Option<Block> {
+            let id = world.block(c[0], c[1], c[2]);
+            let mut blocks = blocks.borrow_mut();
+            let slot = blocks.get_mut(id.0 as usize)?;
+            if slot.is_none() {
+                let f = facts.get(id);
+                let water = f.fluid == horizon_items::blocks::Fluid::Water;
+                let surface = if f.full_collision {
+                    Some(Surface::classify(&f.name, &f.sounds.break_sound))
+                } else {
+                    // Kelp, seagrass and the like are water to the sound.
+                    Surface::classify_partial(&f.name, &f.sounds.break_sound)
+                        .or(water.then_some(Surface::Water))
+                };
+                let cube = f.outline.len() == 1 && f.outline[0] == [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+                let shape = (!f.full_collision
+                    && surface.is_some_and(|s| s.is_solid() && s != Surface::Water)
+                    && !f.outline.is_empty()
+                    && !cube)
+                    .then(|| f.outline.clone());
+                *slot = Some(Block {
+                    surface,
+                    seals: shape.as_deref().map_or(0, acoustics::shape_seals),
+                    full: surface.is_some_and(Surface::is_solid) && shape.is_none(),
+                    shape,
+                    water,
+                });
+            }
+            slot.clone()
+        };
+        // The head under water: the world is muffled, and the water around is the medium, not walls.
+        let underwater = state.underwater
+            && block(listener.map(|v| v.floor() as i32)).is_some_and(|b| b.water);
+        acoustics::publish_underwater(underwater);
+        let medium = |b: &Block| underwater && b.surface == Some(Surface::Water);
+        // For the rays: the surface and the shape.
+        let mut wall = |c: [i32; 3]| -> Option<(Surface, Option<acoustics::Shape>)> {
+            let b = block(c)?;
+            if medium(&b) {
+                return None;
+            }
+            Some((b.surface?, b.shape))
+        };
+        // For the reflection and pathing grids, whole cells: a shaped block counts if it closes the cell between
+        // two open ones (a closed door, a slab floor over a void), not otherwise (an open door, a slab on the ground).
+        let mut cell = |c: [i32; 3]| -> Option<Surface> {
+            let b = block(c)?;
+            if medium(&b) {
+                return None;
+            }
+            let surface = b.surface?;
+            if b.shape.is_some()
+                && !acoustics::shape_blocks_cell(b.seals, |o| {
+                    block([c[0] + o[0], c[1] + o[1], c[2] + o[2]]).is_some_and(|n| n.full && !medium(&n))
+                })
+            {
+                return None;
+            }
+            Some(surface)
+        };
+        if !(state.occlusion || state.reverb) {
+            state.blocks = blocks.into_inner();
+            return;
+        }
         let d2 = |at: [f64; 3]| (0..3).map(|i| (at[i] - listener[i]).powi(2)).sum::<f64>();
         if state.sources.len() > MAX_SOURCES {
             state.sources.sort_by(|a, b| d2(a.1).total_cmp(&d2(b.1)));
             state.sources.truncate(MAX_SOURCES);
         }
-
-        // Walls: full collision cubes, of the surface their block and sound type say; and what is not a full cube
-        // but counts (liquids, slabs and stairs, leaves, fences and panes: `Surface::classify_partial`).
-        let key = facts as *const horizon_items::blocks::BlockFacts as usize;
-        if state.facts != key || state.surfaces.len() != facts.states.len() {
-            state.facts = key;
-            state.surfaces.clear();
-            state.surfaces.resize(facts.states.len(), 0);
-        }
-        let surfaces = &mut state.surfaces;
-        let mut wall = |c: [i32; 3]| -> Option<Surface> {
-            let id = world.block(c[0], c[1], c[2]);
-            let slot = surfaces.get_mut(id.0 as usize)?;
-            if *slot == 0 {
-                let f = facts.get(id);
-                let surface = if f.full_collision {
-                    Some(Surface::classify(&f.name, &f.sounds.break_sound))
-                } else {
-                    Surface::classify_partial(&f.name, &f.sounds.break_sound)
-                };
-                *slot = surface.map_or(1, |surface| {
-                    2 + Surface::ALL.iter().position(|s| *s == surface).unwrap_or(0) as u8
-                });
-            }
-            (*slot >= 2).then(|| Surface::ALL[usize::from(*slot - 2)])
-        };
 
         if let Some(settings) = settings {
             state.results.clear();
@@ -211,7 +294,13 @@ pub fn update_acoustics(
                 let mut nearest: Vec<(u64, [f64; 3])> = state
                     .sources
                     .iter()
-                    .filter(|(_, at, _)| d2(*at) <= OWN_REFLECTIONS_DISTANCE.powi(2))
+                    .filter(|(id, at, _)| {
+                        d2(*at) <= OWN_REFLECTIONS_DISTANCE.powi(2)
+                            && state
+                                .playing_since
+                                .iter()
+                                .any(|(p, t)| p == id && t.elapsed() >= OWN_REFLECTIONS_AGE)
+                    })
                     .map(|(id, at, _)| (*id, *at))
                     .collect();
                 nearest.sort_by(|a, b| d2(a.1).total_cmp(&d2(b.1)).then(a.0.cmp(&b.0)));
@@ -222,7 +311,8 @@ pub fn update_acoustics(
             let baked = if state.pathing { paths::latest() } else { None };
             let occluding = if state.occlusion { &state.sources[..] } else { &[] };
             for (id, at, attenuation) in occluding {
-                let mut result = acoustics::source_acoustics(&mut wall, listener, *at, &settings);
+                let mut result =
+                    acoustics::source_acoustics_shaped(&mut wall, listener, *at, &settings);
                 if result.occlusion < 1.0
                     && let Some(baked) = &baked
                     && let Some(mut path) = baked.find(listener, *at)
@@ -246,17 +336,27 @@ pub fn update_acoustics(
         }
         // The blocks around the camera, for the reverb and the paths: a slice of the grid each frame, the grid to
         // the simulation and the pathing bake when complete.
-        if (state.reverb || state.pathing)
-            && let Some(grid) = state.grid.step(listener, GRID_BUDGET, &mut wall)
-        {
-            let grid = Arc::new(grid);
-            if state.reverb {
-                reflections::submit_grid(&grid);
-            }
-            if state.pathing {
-                paths::submit_grid(&grid);
+        if state.reverb || state.pathing {
+            let refresh = state.grid_origin == Some(GridBuilder::origin_for(listener));
+            let (budget, start) = (if refresh { GRID_REFRESH } else { GRID_BUDGET }, Instant::now());
+            let mut copied = 0;
+            while copied < budget && start.elapsed() < GRID_TIME {
+                let slice = GRID_SLICE.min(budget - copied);
+                copied += slice;
+                if let Some(grid) = state.grid.step(listener, slice, &mut cell) {
+                    state.grid_origin = Some(grid.origin());
+                    let grid = Arc::new(grid);
+                    if state.reverb {
+                        reflections::submit_grid(&grid);
+                    }
+                    if state.pathing {
+                        paths::submit_grid(&grid);
+                    }
+                    break;
+                }
             }
         }
+        state.blocks = blocks.into_inner();
     });
 }
 
@@ -304,6 +404,7 @@ fn render_binaural(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u
         let listener = mixer.listener;
         let world = mixer.worlds.get(&0).copied().unwrap_or_default();
         renderer.begin(owner);
+        let physical = renderer.config().physical_distance;
         renderer.set_orientation(forward.map(|v| v as f32), up.map(|v| v as f32));
         for (&id, c) in &mixer.channels {
             let Some((_, source_rate)) = &c.samples else {
@@ -325,7 +426,7 @@ fn render_binaural(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u
             let distance = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() as f32;
             // A source in another world is unheard but still advances, as in Horizon's mixer.
             let gain = if c.relative || c.world == world {
-                c.gain.clamp(0.0, 1.0) * distance_gain(c.linear, distance)
+                c.gain.clamp(0.0, 1.0) * distance_gain(c.linear, distance, physical)
             } else {
                 0.0
             };

@@ -39,13 +39,15 @@ pub enum Item {
     Pathing,
     Reverb,
     ReverbLevel,
+    Underwater,
+    Distance,
     Interpolation,
     Voices,
     Reset,
 }
 
 /// The page's buttons, in order.
-pub const ITEMS: [Item; 10] = [
+pub const ITEMS: [Item; 12] = [
     Item::Enabled,
     Item::AirAbsorption,
     Item::Occlusion,
@@ -53,6 +55,8 @@ pub const ITEMS: [Item; 10] = [
     Item::Pathing,
     Item::Reverb,
     Item::ReverbLevel,
+    Item::Underwater,
+    Item::Distance,
     Item::Interpolation,
     Item::Voices,
     Item::Reset,
@@ -111,6 +115,26 @@ pub fn labels(config: &Config, language: &str) -> Vec<String> {
                 format!("Уровень реверберации: {}", percent(config.reverb_level))
             }
             (Item::ReverbLevel, false) => format!("Reverb level: {}", percent(config.reverb_level)),
+            (Item::Underwater, true) => format!("Глухо под водой: {}", on_off(config.underwater)),
+            (Item::Underwater, false) => {
+                format!("Muffled under water: {}", on_off(config.underwater))
+            }
+            (Item::Distance, true) => format!(
+                "Затухание с расстоянием: {}",
+                if config.physical_distance {
+                    "Физическое"
+                } else {
+                    "Как в Horizon"
+                }
+            ),
+            (Item::Distance, false) => format!(
+                "Distance attenuation: {}",
+                if config.physical_distance {
+                    "Physical"
+                } else {
+                    "Horizon's"
+                }
+            ),
             (Item::Interpolation, true) => format!(
                 "Интерполяция HRTF: {}",
                 if config.bilinear {
@@ -151,6 +175,8 @@ pub fn click(config: &mut Config, index: usize) -> bool {
         Item::Pathing => config.pathing = !config.pathing,
         Item::Reverb => config.reverb = !config.reverb,
         Item::ReverbLevel => config.reverb_level = next(&REVERB_LEVELS, config.reverb_level + 1e-4),
+        Item::Underwater => config.underwater = !config.underwater,
+        Item::Distance => config.physical_distance = !config.physical_distance,
         Item::Interpolation => config.bilinear = !config.bilinear,
         Item::Voices => config.max_binaural_voices = next(&VOICES, config.max_binaural_voices),
         Item::Reset => {
@@ -166,7 +192,7 @@ pub fn click(config: &mut Config, index: usize) -> bool {
 }
 
 /// The keys the page keeps, and their values in `config`.
-pub fn values(config: &Config) -> [(&'static str, String); 9] {
+pub fn values(config: &Config) -> [(&'static str, String); 11] {
     let switch = |on: bool| if on { "on" } else { "off" }.to_owned();
     [
         ("enabled", switch(config.enabled)),
@@ -176,6 +202,16 @@ pub fn values(config: &Config) -> [(&'static str, String); 9] {
         ("pathing", switch(config.pathing)),
         ("reverb", switch(config.reverb)),
         ("reverb_level", config.reverb_level.to_string()),
+        ("underwater", switch(config.underwater)),
+        (
+            "distance",
+            if config.physical_distance {
+                "physical"
+            } else {
+                "vanilla"
+            }
+            .to_owned(),
+        ),
         (
             "interpolation",
             if config.bilinear {
@@ -201,11 +237,15 @@ pub fn apply_saved(config: &mut Config, read: &dyn Fn(&str) -> Option<String>) {
     switch("occlusion", &mut config.occlusion);
     switch("pathing", &mut config.pathing);
     switch("reverb", &mut config.reverb);
+    switch("underwater", &mut config.underwater);
     if let Some(v) = read("walls").and_then(|v| parse_number(&v, 0.0..=1.0)) {
         config.walls = v;
     }
     if let Some(v) = read("reverb_level").and_then(|v| parse_number(&v, 0.0..=2.0)) {
         config.reverb_level = v;
+    }
+    if let Some(v) = read("distance") {
+        config.physical_distance = !v.trim().eq_ignore_ascii_case("vanilla");
     }
     if let Some(v) = read("interpolation") {
         config.bilinear = v.trim().eq_ignore_ascii_case("bilinear");
@@ -256,7 +296,10 @@ mod tests {
         assert_eq!(en[6], "Reverb level: 50%");
         let ru = labels(&config, "ru_ru");
         assert_eq!(ru[2], "Стены глушат звук: Вкл");
-        assert_eq!(ru[8], "Бинауральных голосов: 32");
+        assert_eq!(ru[7], "Глухо под водой: Вкл");
+        assert_eq!(en[7], "Muffled under water: On");
+        assert_eq!(ru[8], "Затухание с расстоянием: Физическое");
+        assert_eq!(ru[10], "Бинауральных голосов: 32");
         assert!(description("ru_ru").contains("наушников"));
     }
 
@@ -272,13 +315,13 @@ mod tests {
             })
             .collect();
         assert_eq!(walls, [0.5, 0.75, 1.0, 0.0, 0.15, 0.25, 0.35]);
-        click(&mut config, 8);
+        click(&mut config, 10);
         assert_eq!(config.max_binaural_voices, 48);
         config.max_binaural_voices = 20;
-        click(&mut config, 8);
+        click(&mut config, 10);
         assert_eq!(config.max_binaural_voices, 32);
         config.max_binaural_voices = 100;
-        click(&mut config, 8);
+        click(&mut config, 10);
         assert_eq!(config.max_binaural_voices, 8);
         assert!(!click(&mut config, 99));
     }
@@ -306,6 +349,8 @@ mod tests {
         click(&mut changed, 4);
         click(&mut changed, 6);
         click(&mut changed, 7);
+        click(&mut changed, 8);
+        click(&mut changed, 9);
         let kept: HashMap<&str, String> = values(&changed).into_iter().collect();
         let mut loaded = Config::default();
         apply_saved(&mut loaded, &|key| kept.get(key).cloned());

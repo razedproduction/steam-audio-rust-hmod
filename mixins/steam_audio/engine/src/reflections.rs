@@ -380,7 +380,7 @@ impl GridBuilder {
 
 /// Most sources simulated with reflections of their own (the nearest, which the game thread picks): their early
 /// reflections come from where they are, not from where the listener is. The other sources share the listener's.
-pub const MAX_SOURCES: usize = 4;
+pub const MAX_SOURCES: usize = 2;
 /// A source moving less than this (blocks) keeps refining its reflections; farther, they start over.
 const SOURCE_TOLERANCE: f64 = 1.0;
 

@@ -9,7 +9,9 @@
 //! coefficient. The direct path's band gains are then Steam Audio's `occlusion + (1 - occlusion) · transmission`
 //! (`DirectEffect`).
 //!
-//! A full cube of collision is a wall; everything else (slabs, fences, leaves, fluids) lets sound through. A wall's
+//! A full cube of collision is a wall, and so are the blocks [`Surface::classify_partial`] counts (liquids, slabs,
+//! stairs, doors...); leaves and fences only filter what goes through them. A wall that is not a full cube has the
+//! shape of its block state ([`Shape`]: a bottom slab, a closed or an open door), and rays pass beside it. A wall's
 //! material is one of Steam Audio's presets, chosen from the block's sound type.
 //!
 //! The game thread [`publish`]es its results; the audio thread takes them with [`Snapshot::update`], which never
@@ -183,9 +185,9 @@ impl Surface {
     }
 
     /// The surface of a block without full collision, if it counts acoustically: liquids (water is [`Water`], lava
-    /// [`Rock`](Self::Rock)), slabs, stairs and other blocks that are mostly solid (as [`classify`](Self::classify)
-    /// says), leaves ([`Foliage`]) and fences, panes, bars, chains and walls ([`Thin`]). Anything else (flowers,
-    /// torches, carpets, doors, rails...) lets sound through untouched.
+    /// [`Rock`](Self::Rock)), slabs, stairs, doors, trapdoors and other blocks that are mostly solid (as
+    /// [`classify`](Self::classify) says), leaves ([`Foliage`]) and fences, panes, bars, chains and walls ([`Thin`]).
+    /// Anything else (flowers, torches, carpets, rails...) lets sound through untouched.
     ///
     /// [`Water`]: Self::Water
     /// [`Foliage`]: Self::Foliage
@@ -205,6 +207,10 @@ impl Surface {
         // Before the solid ones: `*_wall` but not `*_wall_sign`, `*_wall_torch`, `*_wall_banner`...
         if any(&["fence", "pane", "iron_bars", "chain"]) || id.ends_with("_wall") {
             return Some(Self::Thin);
+        }
+        // Doors and trapdoors are walls of their material where they are: their shape says whether they are open.
+        if any(&["door"]) && !any(&["sign"]) {
+            return Some(Self::classify(block, break_sound));
         }
         if any(&[
             "slab",
@@ -236,6 +242,94 @@ impl Surface {
         }
         None
     }
+}
+
+/// The shape of a block state that is not a full cube: its boxes in block space (`[min x, y, z, max x, y, z]`, 0 to
+/// 1), as the game's outline has them. A bottom slab is `[0, 0, 0, 1, 0.5, 1]`; a door, closed or open, is a panel
+/// 3/16 thick on the side its state says.
+pub type Shape = std::sync::Arc<[[f64; 6]]>;
+
+/// Whether the segment `from` → `to` passes through one of the boxes of `shape` in `cell` (slab test; a point,
+/// `from == to`, whether it is inside one).
+pub fn segment_hits_shape(
+    from: [f64; 3],
+    to: [f64; 3],
+    cell: [i32; 3],
+    shape: &[[f64; 6]],
+) -> bool {
+    let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    shape.iter().any(|b| {
+        let (mut t0, mut t1) = (0.0f64, 1.0f64);
+        for a in 0..3 {
+            let lo = f64::from(cell[a]) + b[a];
+            let hi = f64::from(cell[a]) + b[a + 3];
+            if d[a].abs() < 1e-12 {
+                if from[a] < lo || from[a] > hi {
+                    return false;
+                }
+                continue;
+            }
+            let (mut ta, mut tb) = ((lo - from[a]) / d[a], (hi - from[a]) / d[a]);
+            if ta > tb {
+                std::mem::swap(&mut ta, &mut tb);
+            }
+            t0 = t0.max(ta);
+            t1 = t1.min(tb);
+            if t0 > t1 {
+                return false;
+            }
+        }
+        true
+    })
+}
+
+/// The axes (bit 0 x, 1 y, 2 z) along which `shape` closes its cell: seen along the axis, its boxes cover the whole
+/// face. A bottom slab closes y; a door closes the axis across its panel; a fence post closes none.
+pub fn shape_seals(shape: &[[f64; 6]]) -> u8 {
+    // Block shapes are made of sixteenths: a 16 × 16 raster of each face is exact.
+    const N: usize = 16;
+    let mut seals = 0;
+    for axis in 0..3 {
+        let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+        let mut covered = [[false; N]; N];
+        for b in shape {
+            if b[axis + 3] - b[axis] <= 1e-9 {
+                continue;
+            }
+            for (i, row) in covered.iter_mut().enumerate() {
+                let cu = (i as f64 + 0.5) / N as f64;
+                if cu < b[u] || cu > b[u + 3] {
+                    continue;
+                }
+                for (j, cell) in row.iter_mut().enumerate() {
+                    let cv = (j as f64 + 0.5) / N as f64;
+                    if cv >= b[v] && cv <= b[v + 3] {
+                        *cell = true;
+                    }
+                }
+            }
+        }
+        if covered.iter().all(|row| row.iter().all(|&c| c)) {
+            seals |= 1 << axis;
+        }
+    }
+    seals
+}
+
+/// Whether a block of `shape` that closes its cell along an axis ([`shape_seals`]) stands in the way along it:
+/// `full(offset)` says whether the neighbour at that offset is a full wall. A closed door between two open cells
+/// does; an open one, whose panel lies along the wall beside it, does not, nor does a slab on the ground. The
+/// reflection and pathing grids, which have whole cells only, count such blocks as walls and no others.
+pub fn shape_blocks_cell(seals: u8, mut full: impl FnMut([i32; 3]) -> bool) -> bool {
+    (0..3).any(|axis| {
+        if seals & (1 << axis) == 0 {
+            return false;
+        }
+        let mut step = [0; 3];
+        step[axis] = 1;
+        let back = step.map(|v| -v);
+        !full(step) && !full(back)
+    })
 }
 
 /// How one source reaches the listener: the fraction of its volume in plain sight and, along the line of sight,
@@ -377,13 +471,37 @@ pub fn cells_between(from: [f64; 3], to: [f64; 3], mut visit: impl FnMut([i32; 3
     }
 }
 
-/// How `source` reaches `listener` through the walls `wall` reports (`None`: no wall in that cell).
+/// How `source` reaches `listener` through the walls `wall` reports (`None`: no wall in that cell), all full cubes.
 pub fn source_acoustics(
     wall: &mut impl FnMut([i32; 3]) -> Option<Surface>,
     listener: [f64; 3],
     source: [f64; 3],
     settings: &AcousticsSettings,
 ) -> SourceAcoustics {
+    source_acoustics_shaped(
+        &mut |c| wall(c).map(|s| (s, None)),
+        listener,
+        source,
+        settings,
+    )
+}
+
+/// How `source` reaches `listener` through the walls `wall` reports: each with its surface and, when it is not a
+/// full cube, its [`Shape`], which a ray must go through to be stopped or filtered by it.
+pub fn source_acoustics_shaped(
+    wall: &mut impl FnMut([i32; 3]) -> Option<(Surface, Option<Shape>)>,
+    listener: [f64; 3],
+    source: [f64; 3],
+    settings: &AcousticsSettings,
+) -> SourceAcoustics {
+    // What of the cell `c` the segment `from` → `to` meets.
+    let mut wall = |c: [i32; 3], from: [f64; 3], to: [f64; 3]| -> Option<Surface> {
+        let (surface, shape) = wall(c)?;
+        match shape {
+            Some(shape) if !segment_hits_shape(from, to, c, &shape) => None,
+            _ => Some(surface),
+        }
+    };
     let r = settings.source_radius;
     // The centre, around it and above it: points below a source on the ground would be in the ground.
     let offsets = [
@@ -395,19 +513,18 @@ pub fn source_acoustics(
         [0.0, r, 0.0],
     ];
     let source_cell = source.map(|v| v.floor() as i32);
-    let mut solid = |c: [i32; 3]| wall(c).filter(|s| s.is_solid());
     let (mut seen, mut aimed) = (0u32, 0u32);
     for (i, o) in offsets.iter().enumerate() {
         let point = [source[0] + o[0], source[1] + o[1], source[2] + o[2]];
         let cell = point.map(|v| v.floor() as i32);
         // A point inside a wall other than the source's own block is not part of the source.
-        if i > 0 && cell != source_cell && solid(cell).is_some() {
+        if i > 0 && cell != source_cell && wall(cell, point, point).is_some_and(Surface::is_solid) {
             continue;
         }
         aimed += 1;
         let mut clear = true;
         cells_between(listener, point, |c, _| {
-            if c != source_cell && solid(c).is_some() {
+            if c != source_cell && wall(c, listener, point).is_some_and(Surface::is_solid) {
                 clear = false;
             }
             clear
@@ -428,7 +545,7 @@ pub fn source_acoustics(
         if c == source_cell {
             return true;
         }
-        match wall(c) {
+        match wall(c, listener, source) {
             Some(surface)
                 if surface.is_solid() && occlusion < 1.0 && walls < settings.max_walls =>
             {
@@ -460,6 +577,7 @@ pub fn source_acoustics(
 #[derive(Debug)]
 struct Shared {
     sources: HashMap<u64, SourceAcoustics>,
+    underwater: bool,
     /// Bumped on each publish.
     version: u64,
 }
@@ -467,9 +585,24 @@ struct Shared {
 static SHARED: LazyLock<Mutex<Shared>> = LazyLock::new(|| {
     Mutex::new(Shared {
         sources: HashMap::new(),
+        underwater: false,
         version: 0,
     })
 });
+
+/// What one band of the sound loses when the listener is under water: water carries the lows, and the ears, full of
+/// it, hear little above them (Steam Audio's bands: up to 800 Hz, to 8 kHz, above).
+pub const UNDERWATER_GAINS: [f32; NUM_BANDS] = [0.9, 0.3, 0.06];
+
+/// Publishes whether the listener is under water.
+pub fn publish_underwater(underwater: bool) {
+    if let Ok(mut shared) = SHARED.lock()
+        && shared.underwater != underwater
+    {
+        shared.underwater = underwater;
+        shared.version += 1;
+    }
+}
 
 /// How much of the way to a new value one publish moves: changes settle over a few updates instead of jumping
 /// when the camera passes a corner.
@@ -493,6 +626,7 @@ pub fn publish(sources: &[(u64, SourceAcoustics)]) {
 pub fn clear() {
     if let Ok(mut shared) = SHARED.lock() {
         shared.sources.clear();
+        shared.underwater = false;
         shared.version += 1;
     }
 }
@@ -501,6 +635,8 @@ pub fn clear() {
 #[derive(Debug)]
 pub struct Snapshot {
     pub sources: HashMap<u64, SourceAcoustics>,
+    /// Whether the listener is under water.
+    pub underwater: bool,
     version: u64,
     /// Set by [`Snapshot::fixed`]: ignores what is published.
     fixed: bool,
@@ -510,6 +646,7 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self {
             sources: HashMap::new(),
+            underwater: false,
             version: u64::MAX,
             fixed: false,
         }
@@ -521,6 +658,7 @@ impl Snapshot {
     pub fn fixed(sources: HashMap<u64, SourceAcoustics>) -> Self {
         Self {
             sources,
+            underwater: false,
             version: u64::MAX,
             fixed: true,
         }
@@ -539,6 +677,7 @@ impl Snapshot {
         }
         self.version = shared.version;
         self.sources.clone_from(&shared.sources);
+        self.underwater = shared.underwater;
     }
 
     /// The direct path's band gains for source `id` (open when unknown).
@@ -738,6 +877,16 @@ mod tests {
                 "minecraft:block.wood.break",
                 None,
             ),
+            (
+                "minecraft:oak_door",
+                "minecraft:block.wooden_door.break",
+                Some(Surface::Wood),
+            ),
+            (
+                "minecraft:iron_trapdoor",
+                "minecraft:block.metal.break",
+                Some(Surface::Metal),
+            ),
             ("minecraft:wall_torch", "minecraft:block.wood.break", None),
             ("minecraft:poppy", "minecraft:block.grass.break", None),
             ("minecraft:white_carpet", "minecraft:block.wool.break", None),
@@ -767,6 +916,90 @@ mod tests {
             "a hedge muffles, it does not silence: {gains:?}"
         );
     }
+    // Door panels 3/16 thick: across x (closed in a doorway along x) and along it (open, against the side).
+    const PANEL_X: [[f64; 6]; 1] = [[0.0, 0.0, 0.0, 0.1875, 1.0, 1.0]];
+    const PANEL_Z: [[f64; 6]; 1] = [[0.0, 0.0, 0.0, 1.0, 1.0, 0.1875]];
+    const BOTTOM_SLAB: [[f64; 6]; 1] = [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]];
+
+    #[test]
+    fn shapes_are_hit_where_they_are() {
+        let cell = [3, 64, 0];
+        // Along x at mid height: a bottom slab is passed over, a panel across the way is not.
+        let (from, to) = ([0.5, 64.75, 0.5], [6.5, 64.75, 0.5]);
+        assert!(!segment_hits_shape(from, to, cell, &BOTTOM_SLAB));
+        assert!(segment_hits_shape(
+            [0.5, 64.25, 0.5],
+            [6.5, 64.25, 0.5],
+            cell,
+            &BOTTOM_SLAB
+        ));
+        assert!(segment_hits_shape(from, to, cell, &PANEL_X));
+        assert!(!segment_hits_shape(
+            [0.5, 64.5, 0.6],
+            [6.5, 64.5, 0.6],
+            cell,
+            &PANEL_Z
+        ));
+        // A point.
+        assert!(segment_hits_shape(
+            [3.5, 64.2, 0.5],
+            [3.5, 64.2, 0.5],
+            cell,
+            &BOTTOM_SLAB
+        ));
+        assert!(!segment_hits_shape(
+            [3.5, 64.8, 0.5],
+            [3.5, 64.8, 0.5],
+            cell,
+            &BOTTOM_SLAB
+        ));
+
+        assert_eq!(shape_seals(&BOTTOM_SLAB), 0b010);
+        assert_eq!(shape_seals(&PANEL_X), 0b001);
+        // A fence post closes nothing.
+        assert_eq!(shape_seals(&[[0.375, 0.0, 0.375, 0.625, 1.5, 0.625]]), 0);
+        // Stairs facing north: a bottom slab and the back half above it.
+        let stairs = [
+            [0.0, 0.0, 0.0, 1.0, 0.5, 1.0],
+            [0.0, 0.5, 0.0, 1.0, 1.0, 0.5],
+        ];
+        assert_eq!(shape_seals(&stairs), 0b110);
+    }
+
+    #[test]
+    fn a_closed_door_muffles_and_an_open_one_does_not() {
+        let settings = AcousticsSettings::default();
+        let (listener, source) = ([0.5, 64.6, 0.5], [6.5, 64.5, 0.5]);
+        // A stone wall at x = 3 with a doorway two blocks high at z = 0, a wooden door in it.
+        let door = |panel: &'static [[f64; 6]]| {
+            move |c: [i32; 3]| {
+                if c[0] != 3 || !(63..=66).contains(&c[1]) || c[2].abs() > 2 {
+                    return None;
+                }
+                if c[2] == 0 && (64..=65).contains(&c[1]) {
+                    return Some((Surface::Wood, Some(Shape::from(panel))));
+                }
+                Some((Surface::Rock, None))
+            }
+        };
+        let closed = source_acoustics_shaped(&mut door(&PANEL_X), listener, source, &settings);
+        let open = source_acoustics_shaped(&mut door(&PANEL_Z), listener, source, &settings);
+        assert!(closed.occlusion < 0.5, "{closed:?}");
+        assert!(
+            open.occlusion > closed.occlusion,
+            "open {open:?}, closed {closed:?}"
+        );
+        assert!(open.direct_gains()[2] > 2.0 * closed.direct_gains()[2]);
+
+        // The grids: a closed door between two open cells closes its cell; the open one lies along the wall.
+        let wall_beside = |o: [i32; 3]| o[2] != 0;
+        assert!(shape_blocks_cell(shape_seals(&PANEL_X), wall_beside));
+        assert!(!shape_blocks_cell(shape_seals(&PANEL_Z), wall_beside));
+        // A slab on the ground does not, a slab floor over a void does.
+        assert!(!shape_blocks_cell(shape_seals(&BOTTOM_SLAB), |o| o[1] < 0));
+        assert!(shape_blocks_cell(shape_seals(&BOTTOM_SLAB), |_| false));
+    }
+
     #[test]
     fn published_values_settle_smoothly() {
         let path = PathAcoustics {
