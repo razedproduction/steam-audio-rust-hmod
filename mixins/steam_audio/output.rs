@@ -604,8 +604,32 @@ mod output {
     /// over and leaves it to Horizon) and when.
     struct Taken {
         mixer: Weak<Mutex<Mixer>>,
-        stream: Option<cpal::Stream>,
+        stream: Held,
         at: Instant,
+    }
+
+    /// The mod's stream, closed only on purpose ([`Held::close`]). Left to itself, it is dropped by the thread-local's
+    /// destructor, which on Windows runs while the process exits, after the system has ended every other thread:
+    /// cpal's drop then joins the stream's thread, finds it gone and panics (a crash report on quitting). Then it is
+    /// left as it is; the process is going anyway.
+    struct Held(Option<cpal::Stream>);
+
+    impl Held {
+        fn is_none(&self) -> bool {
+            self.0.is_none()
+        }
+
+        fn close(&mut self) {
+            drop(self.0.take());
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            if let Some(stream) = self.0.take() {
+                std::mem::forget(stream);
+            }
+        }
     }
 
     thread_local! {
@@ -635,7 +659,9 @@ mod output {
                 return;
             }
             // A first output, another mixer or Horizon's stream reopened: the mod's old stream goes first.
-            *taken = None;
+            if let Some(mut old) = taken.take() {
+                old.stream.close();
+            }
             let stream = match open(&audio.device_name, &mixer) {
                 Ok(stream) => stream,
                 Err(e) => {
@@ -644,7 +670,7 @@ mod output {
                     );
                     *taken = Some(Taken {
                         mixer: Arc::downgrade(&mixer),
-                        stream: None,
+                        stream: Held(None),
                         at: Instant::now(),
                     });
                     return;
@@ -654,15 +680,11 @@ mod output {
                 Some(horizon) => horizon.pause().map_err(|e| e.to_string()),
                 None => Ok(()),
             };
-            let stream = match paused {
-                Ok(()) => Some(stream),
-                Err(e) => {
-                    log::warn!(
-                        "steam_audio: could not pause Horizon's output ({e}); Horizon keeps it"
-                    );
-                    None
-                }
-            };
+            let mut stream = Held(Some(stream));
+            if let Err(e) = paused {
+                log::warn!("steam_audio: could not pause Horizon's output ({e}); Horizon keeps it");
+                stream.close();
+            }
             *taken = Some(Taken {
                 mixer: Arc::downgrade(&mixer),
                 stream,
