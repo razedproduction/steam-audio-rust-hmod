@@ -87,6 +87,8 @@ pub fn update_acoustics(
     // At most this many sources, the nearest, and none farther than this.
     const MAX_SOURCES: usize = 32;
     const MAX_DISTANCE: f64 = 64.0;
+    // Sources whose occlusion and paths are worked out per frame (a round of 32 takes 4 frames).
+    const SOURCES_PER_FRAME: usize = 8;
     // Sources this near get reflections of their own (the nearest `reflections::MAX_SOURCES`), once they have played
     // this long: a footstep or a hit is over before its reflections could be simulated, and new sounds coming all the
     // time would keep the simulation from ever settling.
@@ -94,11 +96,11 @@ pub fn update_acoustics(
     const OWN_REFLECTIONS_AGE: Duration = Duration::from_secs(1);
     // Blocks copied for the reverb and the paths per frame (a whole grid is 589 824), in slices, for at most
     // `GRID_TIME`: a grid around a new place in 24 frames or more. Once the grid around the camera is there, it is
-    // copied again only to see blocks change, `GRID_REFRESH` a frame (about 1.5 s for all of it at 100 fps).
+    // copied again only to see blocks change, `GRID_REFRESH` a frame (about 3 s for all of it at 100 fps).
     const GRID_BUDGET: usize = 24_576;
     const GRID_SLICE: usize = 2_048;
     const GRID_TIME: Duration = Duration::from_micros(1_500);
-    const GRID_REFRESH: usize = 4_096;
+    const GRID_REFRESH: usize = 2_048;
 
     // What a block state is to the sound: its wall surface, if any; its shape when it is a wall but not a full cube
     // (a slab, a door: rays pass beside it), and the axes along which that shape closes its cell; whether it is a full
@@ -125,6 +127,9 @@ pub fn update_acoustics(
         blocks: Vec<Option<Block>>,
         sources: Vec<(u64, [f64; 3], Attenuation)>,
         results: Vec<(u64, acoustics::SourceAcoustics)>,
+        // The round of sources being worked out (its settings) and the next source in it.
+        round: Option<acoustics::AcousticsSettings>,
+        next_source: usize,
         // Since when each source has been playing (by mixer channel id).
         playing_since: Vec<(u64, Instant)>,
         grid: GridBuilder,
@@ -144,6 +149,8 @@ pub fn update_acoustics(
                 blocks: Vec::new(),
                 sources: Vec::new(),
                 results: Vec::new(),
+                round: None,
+                next_source: 0,
                 playing_since: Vec::new(),
                 grid: GridBuilder::new(),
                 grid_origin: None,
@@ -155,7 +162,8 @@ pub fn update_acoustics(
         return;
     }
     CACHE.with_borrow_mut(|state| {
-        let due = state.last.is_none_or(|t| t.elapsed() >= PERIOD);
+        // A new look once the last round of sources is complete (at a low frame rate, a little later than `PERIOD`).
+        let due = state.round.is_none() && state.last.is_none_or(|t| t.elapsed() >= PERIOD);
         let mut settings = None;
         if due {
             state.last = Some(Instant::now());
@@ -307,10 +315,19 @@ pub fn update_acoustics(
                 nearest.truncate(reflections::MAX_SOURCES);
                 reflections::submit_sources(&nearest);
             }
+            state.round = Some(settings);
+            state.next_source = 0;
+        }
+        // The sources' occlusion and paths, `SOURCES_PER_FRAME` a frame: a round over the frames of a period, not
+        // all in one frame. Published when the round is complete.
+        if let Some(settings) = state.round {
             // The paths baked in the blocks around the camera, for the sources a wall hides.
             let baked = if state.pathing { paths::latest() } else { None };
             let occluding = if state.occlusion { &state.sources[..] } else { &[] };
-            for (id, at, attenuation) in occluding {
+            let from = state.next_source.min(occluding.len());
+            let to = (from + SOURCES_PER_FRAME).min(occluding.len());
+            state.next_source = to;
+            for (id, at, attenuation) in &occluding[from..to] {
                 let mut result =
                     acoustics::source_acoustics_shaped(&mut wall, listener, *at, &settings);
                 if result.occlusion < 1.0
@@ -329,9 +346,12 @@ pub fn update_acoustics(
                 }
                 state.results.push((*id, result));
             }
-            acoustics::publish(&state.results);
-            if state.reverb {
-                reflections::submit_listener(listener);
+            if to == occluding.len() {
+                state.round = None;
+                acoustics::publish(&state.results);
+                if state.reverb {
+                    reflections::submit_listener(listener);
+                }
             }
         }
         // The blocks around the camera, for the reverb and the paths: a slice of the grid each frame, the grid to
@@ -361,25 +381,128 @@ pub fn update_acoustics(
 }
 
 /// Mixes one output buffer (interleaved, `channels` per frame): with Steam Audio when it can, else as Horizon does.
+///
+/// Steam Audio's rendering takes milliseconds, more with every source, and the game thread locks the same mixer to
+/// play, move and stop each sound. So the mixer is locked only to take what the rendering needs (each source's
+/// parameters, its samples by `Arc`, its position) and, after, to put the sources' new positions back; the rendering
+/// itself runs unlocked. Horizon's own `mix`, cheap, runs locked as in Horizon.
 #[cfg_attr(not(feature = "audio"), allow(dead_code))]
-pub(super) fn render(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
-    if !render_binaural(mixer, data, channels, rate) {
-        mix(mixer, data, channels, rate);
+pub(super) fn render(mixer: &std::sync::Mutex<Mixer>, data: &mut [f32], channels: usize, rate: u32) {
+    if render_binaural(mixer, data, channels, rate) {
+        return;
     }
-    // Only Horizon's stream may leave `cameras` filled (see the top of this module).
-    mixer.cameras.clear();
+    match mixer.lock() {
+        Ok(mut m) => {
+            mix(&mut m, data, channels, rate);
+            // Only Horizon's stream may leave `cameras` filled (see the top of this module).
+            m.cameras.clear();
+        }
+        Err(_) => data.fill(0.0),
+    }
+}
+
+/// A source as the output took it from the mixer: its samples, read without the mixer's lock, where it was then and
+/// where the rendering has left it.
+#[cfg_attr(not(feature = "audio"), allow(dead_code))]
+struct TakenSource {
+    id: u64,
+    samples: std::sync::Arc<Vec<f32>>,
+    looping: bool,
+    start: f64,
+    position: f64,
+    playing: bool,
 }
 
 /// The vanilla mixer's geometry (camera basis, world check, distance gain) with the samples rendered by Steam Audio.
 /// Returns false, having done nothing, when Horizon should mix.
 #[cfg_attr(not(feature = "audio"), allow(dead_code))]
-fn render_binaural(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) -> bool {
-    // Mono output: nothing to spatialize. Splitscreen: the speakers are nobody's ears.
-    if channels < 2 || !mixer.listeners.is_empty() {
-        return false;
+fn render_binaural(
+    mixer: &std::sync::Mutex<Mixer>,
+    data: &mut [f32],
+    channels: usize,
+    rate: u32,
+) -> bool {
+    use std::cell::RefCell;
+    thread_local! {
+        // The audio thread's sources of the current callback, kept to be refilled without allocating.
+        static SOURCES: RefCell<Vec<TakenSource>> = const { RefCell::new(Vec::new()) };
     }
-    let owner = &*mixer as *const Mixer as usize;
+    let owner = mixer as *const std::sync::Mutex<Mixer> as usize;
     let rendered = with_renderer(rate, |renderer| {
+        SOURCES.with_borrow_mut(|sources| {
+            sources.clear();
+            {
+                let Ok(m) = mixer.lock() else {
+                    return false;
+                };
+                // Mono output: nothing to spatialize. Splitscreen: the speakers are nobody's ears.
+                if channels < 2 || !m.listeners.is_empty() {
+                    return false;
+                }
+                take_voices(&m, renderer, owner, rate, sources);
+            }
+            sources.sort_unstable_by_key(|s| s.id);
+            renderer.render(data, channels, &mut |id, step, out| {
+                let Ok(i) = sources.binary_search_by_key(&id, |s| s.id) else {
+                    out.fill(0.0);
+                    return false;
+                };
+                let s = &mut sources[i];
+                let (position, playing) = read_linear(&s.samples, s.position, step, s.looping, out);
+                s.position = position;
+                s.playing &= playing;
+                s.playing
+            });
+            let Ok(mut m) = mixer.lock() else {
+                return true;
+            };
+            // Where the sources got to, unless the game moved, restarted or stopped one meanwhile.
+            for s in sources.iter() {
+                if let Some(c) = m.channels.get_mut(&s.id)
+                    && c.state == State::Playing
+                    && c.position == s.start
+                    && c.samples
+                        .as_ref()
+                        .is_some_and(|(samples, _)| std::sync::Arc::ptr_eq(samples, &s.samples))
+                {
+                    c.position = s.position;
+                    if !s.playing {
+                        c.state = State::Stopped;
+                    }
+                }
+            }
+            // Horizon's output limiter: the whole buffer together, released over 200 ms.
+            let peak = data.iter().fold(1.0f32, |peak, s| peak.max(s.abs()));
+            m.limiter_peak = m.limiter_peak.max(peak);
+            let release = (-1.0 / (0.2 * rate as f32)).exp();
+            for frame in data.chunks_mut(channels) {
+                let gain = m.limiter_peak.recip();
+                for s in frame {
+                    *s *= gain;
+                }
+                m.limiter_peak = (m.limiter_peak * release).max(peak);
+            }
+            // Only Horizon's stream may leave `cameras` filled (see the top of this module).
+            m.cameras.clear();
+            sources.clear();
+            true
+        })
+    });
+    rendered == Some(true)
+}
+
+/// Gives `renderer` this callback's voices from the locked mixer `m` (the camera, each playing source's gain,
+/// direction and step), and `sources` their samples.
+#[cfg_attr(not(feature = "audio"), allow(dead_code))]
+fn take_voices(
+    m: &Mixer,
+    renderer: &mut steam_audio_hmod::horizon::Renderer,
+    owner: usize,
+    rate: u32,
+    sources: &mut Vec<TakenSource>,
+) {
+    let mixer = m;
+    {
         // The camera's forward and up vectors and OpenAL's right = forward x up, as Horizon's mixer has them.
         let (yaw, pitch) = (
             f64::from(mixer.listener_yaw.to_radians()),
@@ -451,40 +574,18 @@ fn render_binaural(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u
                     0.0
                 },
             });
-        }
-        let sources = &mut mixer.channels;
-        renderer.render(data, channels, &mut |id, step, out| {
-            let Some(c) = sources.get_mut(&id) else {
-                out.fill(0.0);
-                return false;
-            };
-            let Some((samples, _)) = &c.samples else {
-                out.fill(0.0);
-                return false;
-            };
-            let (position, playing) = read_linear(samples, c.position, step, c.looping, out);
-            c.position = position;
-            if !playing {
-                c.state = State::Stopped;
+            if let Some((samples, _)) = &c.samples {
+                sources.push(TakenSource {
+                    id,
+                    samples: samples.clone(),
+                    looping: c.looping,
+                    start: c.position,
+                    position: c.position,
+                    playing: true,
+                });
             }
-            playing
-        });
-    });
-    if rendered.is_none() {
-        return false;
-    }
-    // Horizon's output limiter: the whole buffer together, released over 200 ms.
-    let peak = data.iter().fold(1.0f32, |peak, s| peak.max(s.abs()));
-    mixer.limiter_peak = mixer.limiter_peak.max(peak);
-    let release = (-1.0 / (0.2 * rate as f32)).exp();
-    for frame in data.chunks_mut(channels) {
-        let gain = mixer.limiter_peak.recip();
-        for s in frame {
-            *s *= gain;
         }
-        mixer.limiter_peak = (mixer.limiter_peak * release).max(peak);
     }
-    true
 }
 
 #[cfg(feature = "audio")]
@@ -627,10 +728,8 @@ mod output {
                 move |data: &mut [T], _| {
                     scratch.resize(data.len(), 0.0);
                     match mixer.upgrade() {
-                        Some(m) => match m.lock() {
-                            Ok(mut m) => super::render(&mut m, &mut scratch, channels, rate),
-                            Err(_) => scratch.fill(0.0),
-                        },
+                        // Locks the mixer itself, only as long as it must.
+                        Some(m) => super::render(&m, &mut scratch, channels, rate),
                         // Horizon's audio is gone: silence until the stream goes too.
                         None => scratch.fill(0.0),
                     }
