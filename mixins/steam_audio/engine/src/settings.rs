@@ -7,6 +7,7 @@
 //!
 //! What the page sets is the base; environment variables (`HORIZON_STEAM_AUDIO_*`) win over it while they are set.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::horizon::{Config, parse_number, parse_switch};
@@ -257,6 +258,26 @@ pub fn apply_saved(config: &mut Config, read: &dyn Fn(&str) -> Option<String>) {
 
 static LOADED: AtomicBool = AtomicBool::new(false);
 
+/// What the page itself has set (the defaults and the kept values, without the environment): what a click changes
+/// and what is kept, so an environment variable set for one game is never kept as the page's value.
+static PAGE: Mutex<Option<Config>> = Mutex::new(None);
+
+/// The page's own configuration (before the settings are loaded, the defaults).
+fn page() -> Config {
+    PAGE.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
+/// Makes `page` the page's configuration, and it with the environment over it the game's.
+fn set_page(page: Config) {
+    let mut config = page.clone();
+    *PAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(page);
+    config.apply_vars(|name| std::env::var(name).ok());
+    Config::set(config);
+}
+
 /// Loads the kept settings into the game's configuration, once: the defaults, what `read` has kept, then the
 /// environment. Later calls do nothing.
 pub fn load(read: &dyn Fn(&str) -> Option<String>) {
@@ -265,18 +286,18 @@ pub fn load(read: &dyn Fn(&str) -> Option<String>) {
     }
     let mut config = Config::default();
     apply_saved(&mut config, read);
-    config.apply_vars(|name| std::env::var(name).ok());
-    Config::set(config);
+    set_page(config);
 }
 
-/// A click on button `index` of the page: changes the game's configuration and keeps it through `store`.
+/// A click on button `index` of the page: changes the page's configuration, keeps it through `store` and makes
+/// it, with the environment over it, the game's.
 pub fn click_and_store(index: usize, store: &mut dyn FnMut(&str, &str)) {
-    let mut config = Config::get();
+    let mut config = page();
     if click(&mut config, index) {
         for (key, value) in values(&config) {
             store(key, &value);
         }
-        Config::set(config);
+        set_page(config);
     }
 }
 

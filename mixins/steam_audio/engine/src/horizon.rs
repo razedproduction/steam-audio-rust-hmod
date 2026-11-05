@@ -602,6 +602,8 @@ impl Renderer {
             return;
         }
         let max = self.config.max_binaural_voices.max(MIN_BINAURAL_VOICES);
+        // Starts unlimited (`usize::MAX`): bring it to the configuration's first, so `* 3` can't overflow.
+        self.voice_limit = self.voice_limit.min(max);
         if self.load > HIGH_LOAD && self.voice_limit > MIN_BINAURAL_VOICES {
             self.voice_limit = (self.voice_limit * 3 / 4).max(MIN_BINAURAL_VOICES);
             self.since_change = 0;
@@ -709,6 +711,14 @@ impl Renderer {
             1.0 - *underwater * (1.0 - crate::acoustics::UNDERWATER_GAINS[b])
         });
         let medium_send = medium.iter().sum::<f32>() / NUM_BANDS as f32;
+        // The reverb level this frame ramps to; the sources send to the reverb while it or the last one is above 0
+        // (not at a level of 0: their reverbs would convolve silence).
+        let reverb_target = if config.reverb {
+            config.reverb_level * REFLECTIONS_GAIN
+        } else {
+            0.0
+        };
+        let send_reverb = reverb_target > 0.0 || *wet > 0.0;
         reverb_in.make_silent();
         for r in source_reverbs.values_mut() {
             r.input.make_silent();
@@ -745,7 +755,7 @@ impl Renderer {
             // The reverb hears the source whether or not a wall hides it (sound goes round), through the air: its own
             // reflections if it has some (simulated from where it is, with the air and the distance), else the
             // listener's.
-            if config.reverb {
+            if send_reverb {
                 let (input, send) = match source_reverbs.get_mut(&voice.id).filter(|r| r.own) {
                     Some(r) => {
                         r.sent = true;
@@ -869,11 +879,7 @@ impl Renderer {
 
         // The reverb bus: the simulated reflections of the surroundings (convolved, turning with the head) and their
         // parametric tail. The level fades what goes in, so a change leaves the tail already ringing as it is.
-        let target = if config.reverb {
-            config.reverb_level * REFLECTIONS_GAIN
-        } else {
-            0.0
-        };
+        let target = reverb_target;
         if pending.is_none()
             && let Some(mut new) = incoming.take().or_else(reflections::take)
         {
@@ -882,24 +888,31 @@ impl Renderer {
                 for r in source_reverbs.values_mut() {
                     r.own = false;
                 }
-                for (id, ir) in new.sources.drain(..) {
-                    if !source_reverbs.contains_key(&id) {
-                        // At most `MAX_SOURCE_REVERBS`: a new source's takes the place of one ringing out.
-                        if source_reverbs.len() >= MAX_SOURCE_REVERBS
-                            && let Some(&gone) = source_reverbs
-                                .iter()
-                                .find(|(_, r)| !r.own)
-                                .map(|(id, _)| id)
-                            && let Some(mut r) = source_reverbs.remove(&gone)
-                        {
-                            r.reset();
-                            spare_reverbs.push(r);
-                        }
-                        let r = spare_reverbs
-                            .pop()
-                            .unwrap_or_else(|| SourceReverb::new(settings, *rate));
-                        source_reverbs.insert(id, r);
+                // First a reverb for each of them; then their impulse responses.
+                for k in 0..new.sources.len() {
+                    let id = new.sources[k].0;
+                    if source_reverbs.contains_key(&id) {
+                        continue;
                     }
+                    // At most `MAX_SOURCE_REVERBS`: a new source's takes the place of one ringing out, never of
+                    // one of these sources (their `own` is only set below).
+                    let sources = &new.sources;
+                    if source_reverbs.len() >= MAX_SOURCE_REVERBS
+                        && let Some(&gone) = source_reverbs
+                            .iter()
+                            .find(|(rid, r)| !r.own && !sources.iter().any(|(s, _)| s == *rid))
+                            .map(|(id, _)| id)
+                        && let Some(mut r) = source_reverbs.remove(&gone)
+                    {
+                        r.reset();
+                        spare_reverbs.push(r);
+                    }
+                    let r = spare_reverbs
+                        .pop()
+                        .unwrap_or_else(|| SourceReverb::new(settings, *rate));
+                    source_reverbs.insert(id, r);
+                }
+                for (id, ir) in new.sources.drain(..) {
                     let Some(r) = source_reverbs.get_mut(&id) else {
                         continue;
                     };
@@ -928,12 +941,15 @@ impl Renderer {
             let mut any = false;
             // At most one new impulse response a frame: each crossfades, convolving with both for that frame.
             let mut crossfades = 1usize;
-            let mut update = pending.take();
+            // With nothing going in, new reflections wait: taken now, the convolution would never get their impulse
+            // response while the parametric tail played their reverb times.
+            let silent = target == 0.0 && *wet == 0.0;
+            let mut update = if silent { None } else { pending.take() };
             crossfades -= usize::from(update.is_some());
             if let Some(new) = &update {
                 *playing_reflections = Some((new.reverb, new.eq, new.delay));
             }
-            if target == 0.0 && *wet == 0.0 {
+            if silent {
                 // The reverb is off and nothing goes in: what rings still rings out, then the bus stops.
                 if *reverb_state == AudioEffectState::TailRemaining {
                     *reverb_state = hybrid.tail(ambisonics);

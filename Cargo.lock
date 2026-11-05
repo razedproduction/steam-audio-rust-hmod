@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "steam-audio-hmod"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "log",
  "thiserror",
