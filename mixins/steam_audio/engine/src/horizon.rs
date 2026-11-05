@@ -320,6 +320,19 @@ struct SourceReverb {
 }
 
 impl SourceReverb {
+    /// Back to as new, for another source (its impulse responses to `reflections::recycle`).
+    fn reset(&mut self) {
+        self.effect.reset();
+        self.input.make_silent();
+        self.playing = None;
+        if let Some(old) = self.pending.take() {
+            reflections::recycle(old.fir);
+        }
+        self.state = AudioEffectState::TailComplete;
+        self.own = false;
+        self.sent = false;
+    }
+
     fn new(settings: &AudioSettings, rate: u32) -> Self {
         Self {
             effect: HybridReverbEffect::new(
@@ -339,6 +352,16 @@ impl SourceReverb {
         }
     }
 }
+
+/// The audio thread's load (rendering time over playing time of a frame) above which fewer sources are rendered
+/// binaurally, and below which more are again; the frames between two changes, and the fewest binaural voices.
+const HIGH_LOAD: f32 = 0.6;
+const LOW_LOAD: f32 = 0.35;
+const LOAD_SETTLE_FRAMES: u32 = 20;
+const MIN_BINAURAL_VOICES: usize = 8;
+
+/// Most source reverbs at once: those with reflections of their own and as many ringing out.
+const MAX_SOURCE_REVERBS: usize = 2 * reflections::MAX_SOURCES;
 
 /// The sound of a source coming round what hides it ([`crate::paths`]): a second binaural voice, from where the
 /// paths arrive, with what their bends and length take off each band.
@@ -383,6 +406,14 @@ pub struct Renderer {
     reverb_state: AudioEffectState,
     /// The sources with reflections of their own (by mixer channel id), and where their reverbs are summed.
     source_reverbs: HashMap<u64, SourceReverb>,
+    /// Source reverbs made beforehand and ones that rang out, for the next sources: making one (a second of
+    /// four-channel convolution) takes over a millisecond, too long for the audio thread.
+    spare_reverbs: Vec<SourceReverb>,
+    /// How much of a frame's time rendering it takes (smoothed), the binaural budget it allows and the frames since that
+    /// budget changed.
+    load: f32,
+    voice_limit: usize,
+    since_change: u32,
     source_ambisonics: AudioBuffer,
     wet: f32,
     /// The reflections being played (reverb times, parametric level per band, delay) and new ones not played yet.
@@ -452,7 +483,13 @@ impl Renderer {
             hybrid,
             decode,
             reverb_state: AudioEffectState::TailComplete,
-            source_reverbs: HashMap::new(),
+            source_reverbs: HashMap::with_capacity(MAX_SOURCE_REVERBS),
+            load: 0.0,
+            voice_limit: usize::MAX,
+            since_change: 0,
+            spare_reverbs: (0..MAX_SOURCE_REVERBS)
+                .map(|_| SourceReverb::new(&audio_settings, rate))
+                .collect(),
             source_ambisonics: AudioBuffer::new(reflections::NUM_CHANNELS, FRAME_SIZE),
             wet: 0.0,
             reflections: None,
@@ -543,7 +580,9 @@ impl Renderer {
         self.playing.resize(self.voices.len(), true);
         for frame in out.chunks_exact_mut(channels) {
             if self.taken == FRAME_SIZE {
+                let start = std::time::Instant::now();
                 self.render_frame(read);
+                self.measure_load(start.elapsed());
                 self.taken = 0;
             }
             frame[0] = self.block[2 * self.taken];
@@ -552,18 +591,66 @@ impl Renderer {
         }
     }
 
-    /// The loudest sources with a direction, up to the budget, are rendered binaurally.
+    /// Follows how long frames take to render, relative to how long they play: when the audio thread gets near its
+    /// deadline, fewer sources are rendered binaurally ([`Renderer::choose_binaural`]); with room again, more.
+    fn measure_load(&mut self, took: std::time::Duration) {
+        let frame = FRAME_SIZE as f32 / self.rate as f32;
+        let load = took.as_secs_f32() / frame;
+        self.load += (load - self.load) * 0.1;
+        self.since_change += 1;
+        if self.since_change < LOAD_SETTLE_FRAMES {
+            return;
+        }
+        let max = self.config.max_binaural_voices.max(MIN_BINAURAL_VOICES);
+        if self.load > HIGH_LOAD && self.voice_limit > MIN_BINAURAL_VOICES {
+            self.voice_limit = (self.voice_limit * 3 / 4).max(MIN_BINAURAL_VOICES);
+            self.since_change = 0;
+            log::debug!(
+                "steam_audio: rendering takes {:.0}% of the time; {} binaural voices",
+                self.load * 100.0,
+                self.voice_limit
+            );
+        } else if self.load < LOW_LOAD && self.voice_limit < max {
+            self.voice_limit = (self.voice_limit + 2).min(max);
+            self.since_change = 0;
+        }
+        self.voice_limit = self.voice_limit.min(max);
+    }
+
+    /// The sources rendered binaurally: the loudest with a direction, within the budget, where a source with a way
+    /// round the walls counts twice (its path is a second binaural voice). The budget is the configuration's, lowered
+    /// while the audio thread is busy ([`Renderer::measure_load`]).
     fn choose_binaural(&mut self) {
         let voices = &self.voices;
+        let paths = self.config.occlusion && self.config.pathing;
+        let acoustics = &self.acoustics;
+        let cost = |i: usize| {
+            1 + usize::from(
+                paths
+                    && acoustics
+                        .get(voices[i].id)
+                        .is_some_and(|a| a.path_gain() > 0.0),
+            )
+        };
+        let budget = self.config.max_binaural_voices.min(self.voice_limit);
         self.order.clear();
         self.order.extend(
             (0..voices.len()).filter(|&i| voices[i].direction.is_some() && voices[i].gain > 0.0),
         );
-        if self.order.len() > self.config.max_binaural_voices {
-            self.order
-                .sort_by(|&a, &b| voices[b].gain.total_cmp(&voices[a].gain));
-            self.order.truncate(self.config.max_binaural_voices);
+        self.order
+            .sort_unstable_by(|&a, &b| voices[b].gain.total_cmp(&voices[a].gain));
+        let mut used = 0;
+        let mut kept = 0;
+        for k in 0..self.order.len() {
+            let c = cost(self.order[k]);
+            if used + c > budget {
+                continue;
+            }
+            used += c;
+            self.order[kept] = self.order[k];
+            kept += 1;
         }
+        self.order.truncate(kept);
         self.binaural.clear();
         self.binaural.resize(voices.len(), false);
         for &i in &self.order {
@@ -595,6 +682,7 @@ impl Renderer {
             decode,
             reverb_state,
             source_reverbs,
+            spare_reverbs,
             source_ambisonics,
             wet,
             reflections: playing_reflections,
@@ -795,9 +883,26 @@ impl Renderer {
                     r.own = false;
                 }
                 for (id, ir) in new.sources.drain(..) {
-                    let r = source_reverbs
-                        .entry(id)
-                        .or_insert_with(|| SourceReverb::new(settings, *rate));
+                    if !source_reverbs.contains_key(&id) {
+                        // At most `MAX_SOURCE_REVERBS`: a new source's takes the place of one ringing out.
+                        if source_reverbs.len() >= MAX_SOURCE_REVERBS
+                            && let Some(&gone) = source_reverbs
+                                .iter()
+                                .find(|(_, r)| !r.own)
+                                .map(|(id, _)| id)
+                            && let Some(mut r) = source_reverbs.remove(&gone)
+                        {
+                            r.reset();
+                            spare_reverbs.push(r);
+                        }
+                        let r = spare_reverbs
+                            .pop()
+                            .unwrap_or_else(|| SourceReverb::new(settings, *rate));
+                        source_reverbs.insert(id, r);
+                    }
+                    let Some(r) = source_reverbs.get_mut(&id) else {
+                        continue;
+                    };
                     r.own = true;
                     if let Some(old) = r.pending.replace(ir) {
                         reflections::recycle(old.fir);
@@ -821,11 +926,20 @@ impl Renderer {
             ramp(reverb_in.channel_mut(0), *wet, target);
             ambisonics.make_silent();
             let mut any = false;
+            // At most one new impulse response a frame: each crossfades, convolving with both for that frame.
+            let mut crossfades = 1usize;
             let mut update = pending.take();
+            crossfades -= usize::from(update.is_some());
             if let Some(new) = &update {
                 *playing_reflections = Some((new.reverb, new.eq, new.delay));
             }
-            if let Some((reverb, eq, delay)) = playing_reflections.as_ref() {
+            if target == 0.0 && *wet == 0.0 {
+                // The reverb is off and nothing goes in: what rings still rings out, then the bus stops.
+                if *reverb_state == AudioEffectState::TailRemaining {
+                    *reverb_state = hybrid.tail(ambisonics);
+                    any = true;
+                }
+            } else if let Some((reverb, eq, delay)) = playing_reflections.as_ref() {
                 let ir = match &mut update {
                     Some(new) => HybridReverbIr::Updated(&mut new.fir),
                     None => HybridReverbIr::Current,
@@ -852,8 +966,24 @@ impl Renderer {
                 if !(r.sent || r.state == AudioEffectState::TailRemaining) {
                     continue;
                 }
+                if !r.sent {
+                    // Nothing goes in any more: its tail rings out, and ends (`apply` would keep it going for ever,
+                    // starting the tail over at every frame).
+                    if let Some(old) = r.pending.take() {
+                        reflections::recycle(old.fir);
+                    }
+                    r.state = r.effect.tail(source_ambisonics);
+                    add_ambisonics(ambisonics, source_ambisonics);
+                    any = true;
+                    continue;
+                }
                 ramp(r.input.channel_mut(0), *wet, target);
-                let mut update = r.pending.take();
+                let mut update = if crossfades > 0 {
+                    r.pending.take()
+                } else {
+                    None
+                };
+                crossfades -= usize::from(update.is_some());
                 if let Some(new) = &update {
                     r.playing = Some((new.reverb, new.eq, new.delay));
                 }
@@ -873,15 +1003,7 @@ impl Renderer {
                         &r.input,
                         source_ambisonics,
                     );
-                    for ch in 0..reflections::NUM_CHANNELS {
-                        for (a, &s) in ambisonics
-                            .channel_mut(ch)
-                            .iter_mut()
-                            .zip(source_ambisonics.channel(ch))
-                        {
-                            *a += s;
-                        }
-                    }
+                    add_ambisonics(ambisonics, source_ambisonics);
                     any = true;
                 }
                 if let Some(old) = update {
@@ -905,15 +1027,27 @@ impl Renderer {
                 }
             }
         }
-        // A source's reverb goes once it has no reflections of its own and has rung out.
-        source_reverbs.retain(|_, r| {
-            let keep = r.own || r.sent || r.state == AudioEffectState::TailRemaining;
-            if !keep && let Some(old) = r.pending.take() {
-                reflections::recycle(old.fir);
+        // A source's reverb goes once it has no reflections of its own and has rung out, back to the spares.
+        let gone: Option<u64> = source_reverbs
+            .iter()
+            .find(|(_, r)| !(r.own || r.sent || r.state == AudioEffectState::TailRemaining))
+            .map(|(id, _)| *id);
+        if let Some(mut r) = gone.and_then(|id| source_reverbs.remove(&id)) {
+            r.reset();
+            if spare_reverbs.len() < MAX_SOURCE_REVERBS {
+                spare_reverbs.push(r);
             }
-            keep
-        });
+        }
         *wet = target;
+    }
+}
+
+/// Adds the Ambisonics `from` into `into`, channel by channel.
+fn add_ambisonics(into: &mut AudioBuffer, from: &AudioBuffer) {
+    for ch in 0..reflections::NUM_CHANNELS {
+        for (a, &s) in into.channel_mut(ch).iter_mut().zip(from.channel(ch)) {
+            *a += s;
+        }
     }
 }
 
@@ -1311,6 +1445,211 @@ mod tests {
             });
         }
         start.elapsed().as_secs_f64()
+    }
+
+    /// A busy cave: `voices` sources, every one hidden with a way round (two binaural voices each), `own` with
+    /// reflections of their own, new reflections every 250 ms and a new sound (channel) every 50 ms. Returns the mean
+    /// and the longest 10 ms callback.
+    fn busy_audio_load(voices: u64, own: u64) -> (std::time::Duration, std::time::Duration) {
+        let hidden = |id: u64| {
+            (
+                id,
+                SourceAcoustics {
+                    occlusion: 0.3,
+                    transmission: [0.2, 0.1, 0.05],
+                    through: [1.0; NUM_BANDS],
+                    path: Some(PathAcoustics {
+                        direction: [1.0, 0.0, 0.0],
+                        gain: 0.7,
+                        eq: [0.8, 0.5, 0.3],
+                        distance: 12.0,
+                    }),
+                },
+            )
+        };
+        let reflections = |first: u64| {
+            let mut r = reflections_from([-1.0, 0.0, 0.0]);
+            for id in first..first + own {
+                let s = reflections_from([1.0, 0.0, 0.0]);
+                r.sources.push((
+                    id,
+                    ReverbIr {
+                        fir: s.fir,
+                        reverb: s.reverb,
+                        eq: s.eq,
+                        delay: s.delay,
+                    },
+                ));
+            }
+            r
+        };
+        let tone: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.05).sin() * 0.1).collect();
+        let mut out = vec![0.0; 2 * 480];
+        let mut renderer = renderer_with(&[]);
+        let (mut total, mut longest) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let mut base = 0u64;
+        for call in 0..310u64 {
+            // A new sound every 5 callbacks: the oldest goes, a new channel id comes.
+            if call % 5 == 0 {
+                base += 1;
+                renderer
+                    .set_acoustics(Snapshot::fixed((base..base + voices).map(hidden).collect()));
+            }
+            if call % 25 == 0 {
+                renderer.set_reflections(reflections(base));
+            }
+            renderer.begin(1);
+            for id in base..base + voices {
+                let a = id as f32 * 0.4;
+                renderer.push(Voice {
+                    id,
+                    gain: 0.3,
+                    pan: [0.5, 0.5],
+                    direction: Some([a.sin(), 0.0, -a.cos()]),
+                    distance: 4.0 + (id % 32) as f32,
+                    step: 1.0,
+                    source_gain: 0.3,
+                });
+            }
+            let t = std::time::Instant::now();
+            renderer.render(&mut out, 2, &mut |_, step, buf| {
+                read_linear(&tone, 0.0, step, true, buf);
+                true
+            });
+            let took = t.elapsed();
+            assert!(renderer.source_reverbs.len() <= MAX_SOURCE_REVERBS);
+            if call >= 10 {
+                total += took;
+                longest = longest.max(took);
+            }
+        }
+        (total / 300, longest)
+    }
+
+    #[test]
+    fn source_reverbs_ring_out_and_are_reused() {
+        let mut renderer = renderer_with(&[]);
+        let spares = renderer.spare_reverbs.len();
+        assert_eq!(spares, MAX_SOURCE_REVERBS);
+        // Sources 0..3 in turn get reflections of their own, then none does.
+        for first in 0..4u64 {
+            let mut r = reflections_from([-1.0, 0.0, 0.0]);
+            for id in first..first + 2 {
+                let own = reflections_from([1.0, 0.0, 0.0]);
+                r.sources.push((
+                    id,
+                    ReverbIr {
+                        fir: own.fir,
+                        reverb: own.reverb,
+                        eq: own.eq,
+                        delay: own.delay,
+                    },
+                ));
+            }
+            renderer.set_reflections(r);
+            for id in first..first + 2 {
+                ear_energy_of(&mut renderer, id);
+            }
+            assert!(renderer.source_reverbs.len() <= MAX_SOURCE_REVERBS);
+        }
+        renderer.set_reflections(reflections_from([-1.0, 0.0, 0.0]));
+        // Two seconds of silence: every source's reverb rings out (its tail ends) and goes back to the spares.
+        for _ in 0..10 {
+            tail(&mut renderer, 0);
+        }
+        assert!(
+            renderer.source_reverbs.is_empty(),
+            "{}",
+            renderer.source_reverbs.len()
+        );
+        assert_eq!(renderer.spare_reverbs.len(), spares);
+    }
+
+    /// Renders a short burst of source `id` straight ahead.
+    fn ear_energy_of(renderer: &mut Renderer, id: u64) {
+        let tone: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.1).collect();
+        let mut out = vec![0.0; 2 * 4800];
+        renderer.begin(1);
+        renderer.push(Voice {
+            id,
+            gain: 0.5,
+            pan: [0.5, 0.5],
+            direction: Some([0.0, 0.0, -1.0]),
+            distance: 4.0,
+            step: 1.0,
+            source_gain: 0.5,
+        });
+        renderer.render(&mut out, 2, &mut |_, step, buf| {
+            read_linear(&tone, 0.0, step, true, buf);
+            true
+        });
+    }
+
+    #[test]
+    fn a_busy_audio_thread_renders_fewer_voices_binaurally() {
+        let mut renderer = renderer_with(&[]);
+        let frame = FRAME_SIZE as f64 / 48_000.0;
+        // Frames taking 90% of their time: the budget comes down, not below the minimum.
+        for _ in 0..400 {
+            renderer.measure_load(std::time::Duration::from_secs_f64(frame * 0.9));
+        }
+        assert_eq!(renderer.voice_limit, MIN_BINAURAL_VOICES);
+        // Room again: back up to the configuration's.
+        for _ in 0..2000 {
+            renderer.measure_load(std::time::Duration::from_secs_f64(frame * 0.1));
+        }
+        assert_eq!(renderer.voice_limit, renderer.config.max_binaural_voices);
+    }
+
+    #[test]
+    fn a_way_round_counts_as_a_second_binaural_voice() {
+        let hidden: Vec<(u64, SourceAcoustics)> = (0..32)
+            .map(|id| {
+                (
+                    id,
+                    SourceAcoustics {
+                        occlusion: 0.3,
+                        transmission: [0.2; NUM_BANDS],
+                        through: [1.0; NUM_BANDS],
+                        path: Some(PathAcoustics {
+                            direction: [1.0, 0.0, 0.0],
+                            gain: 0.7,
+                            eq: [0.8, 0.5, 0.3],
+                            distance: 12.0,
+                        }),
+                    },
+                )
+            })
+            .collect();
+        let mut renderer = renderer_with(&hidden);
+        renderer.begin(1);
+        for id in 0..32u64 {
+            renderer.push(Voice {
+                id,
+                gain: 0.5 - id as f32 * 0.01,
+                pan: [0.5, 0.5],
+                direction: Some([0.0, 0.0, -1.0]),
+                distance: 4.0,
+                step: 1.0,
+                source_gain: 0.5,
+            });
+        }
+        renderer.acoustics.update();
+        renderer.choose_binaural();
+        let chosen: Vec<usize> = (0..32).filter(|&i| renderer.binaural[i]).collect();
+        // 32 voices' budget: 16 sources with their ways round, the loudest.
+        assert_eq!(chosen, (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_busy_audio_load() {
+        for (voices, own) in [(16, 0), (32, 0), (32, 2)] {
+            let (mean, longest) = busy_audio_load(voices, own);
+            println!(
+                "{voices} hidden sources with paths, {own} own reverbs: mean {mean:?}, longest {longest:?} per 10 ms callback"
+            );
+        }
     }
 
     #[test]
