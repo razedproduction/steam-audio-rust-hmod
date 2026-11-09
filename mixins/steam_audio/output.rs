@@ -19,7 +19,9 @@
 // hand over to `steam_audio_hmod::settings`.
 
 use super::{Audio, Mixer, State, mix, stereo_gains};
-use steam_audio_hmod::horizon::{Voice, audible_range, distance_gain, read_frames, with_renderer};
+use steam_audio_hmod::horizon::{
+    Voice, audible_range, distance_gain, group_radius, read_frames, with_renderer,
+};
 
 /// Takes Horizon's sound output over, once per output Horizon opens. Called on the game thread at every camera
 /// update; without the `audio` feature there is no output and it does nothing.
@@ -113,6 +115,9 @@ pub fn update_acoustics(
     // time would keep the simulation from ever settling.
     const OWN_REFLECTIONS_DISTANCE: f64 = 32.0;
     const OWN_REFLECTIONS_AGE: Duration = Duration::from_secs(1);
+    // Nor quiet ones (rain is played at 0.1 and 0.2): one after another all around, they would take the reflections'
+    // places from the sounds that are heard, and keep the simulation starting over. They have the listener's reverb.
+    const OWN_REFLECTIONS_GAIN: f32 = 0.25;
     // Blocks copied for the reverb and the paths per frame (a whole grid is 589 824), in slices, for at most
     // `GRID_TIME`: a grid around a new place in 24 frames or more. Once the grid around the camera is there, it is
     // copied again only to see blocks change, `GRID_REFRESH` a frame (about 3 s for all of it at 100 fps).
@@ -148,6 +153,10 @@ pub fn update_acoustics(
         palette: u64,
         blocks: Vec<Option<Block>>,
         sources: Vec<(u64, [f64; 3], Attenuation)>,
+        // Sources near a nearer one (`horizon::group_radius`: a waterfall's splashes, rain on the ground nearby),
+        // given its acoustics instead of rays and paths of their own; and the quiet ones.
+        aliases: Vec<(u64, u64)>,
+        quiet: Vec<u64>,
         results: Vec<(u64, acoustics::SourceAcoustics)>,
         // The round of sources being worked out (its settings) and the next source in it.
         round: Option<acoustics::AcousticsSettings>,
@@ -179,6 +188,8 @@ pub fn update_acoustics(
                 palette: 0,
                 blocks: Vec::new(),
                 sources: Vec::new(),
+                aliases: Vec::new(),
+                quiet: Vec::new(),
                 results: Vec::new(),
                 round: None,
                 next_source: 0,
@@ -239,6 +250,8 @@ pub fn update_acoustics(
             state.layers = debug::Layers::of(&config);
             settings = Some(config.acoustics());
             state.sources.clear();
+            state.aliases.clear();
+            state.quiet.clear();
             // The camera and the sources it can hear, the mixer locked only to copy them.
             if config.occlusion || config.reverb || config.underwater {
                 let Ok(m) = audio.backend.mixer.lock() else {
@@ -261,9 +274,39 @@ pub fn update_acoustics(
                             let attenuation: Attenuation =
                                 Box::new(move |d| distance_gain(linear, d, reach));
                             state.sources.push((id, at, attenuation));
+                            if c.gain < OWN_REFLECTIONS_GAIN {
+                                state.quiet.push(id);
+                            }
                         }
                     }
                 }
+            }
+            // Nearest first; a source near a nearer one is looked at as that one (the renderer plays them as one
+            // binaural voice too).
+            if let Some(listener) = state.listener {
+                let distance =
+                    |at: &[f64; 3]| (0..3).map(|i| (at[i] - listener[i]).powi(2)).sum::<f64>().sqrt();
+                state
+                    .sources
+                    .sort_by(|a, b| distance(&a.1).total_cmp(&distance(&b.1)));
+                let mut kept: Vec<(u64, [f64; 3])> = Vec::new();
+                let aliases = &mut state.aliases;
+                state.sources.retain(|(id, at, _)| {
+                    let radius = group_radius(distance(at));
+                    let near = kept.iter().find(|(_, k)| {
+                        (0..3).map(|i| (at[i] - k[i]).powi(2)).sum::<f64>() <= radius * radius
+                    });
+                    match near {
+                        Some(&(to, _)) => {
+                            aliases.push((*id, to));
+                            false
+                        }
+                        None => {
+                            kept.push((*id, *at));
+                            true
+                        }
+                    }
+                });
             }
             let now = Instant::now();
             let sources = &state.sources;
@@ -391,6 +434,10 @@ pub fn update_acoustics(
         if state.sources.len() > MAX_SOURCES {
             state.sources.sort_by(|a, b| d2(a.1).total_cmp(&d2(b.1)));
             state.sources.truncate(MAX_SOURCES);
+            let sources = &state.sources;
+            state
+                .aliases
+                .retain(|(_, to)| sources.iter().any(|s| s.0 == *to));
         }
 
         if let Some(settings) = settings {
@@ -401,7 +448,8 @@ pub fn update_acoustics(
                     .sources
                     .iter()
                     .filter(|(id, at, _)| {
-                        d2(*at) <= OWN_REFLECTIONS_DISTANCE.powi(2)
+                        !state.quiet.contains(id)
+                            && d2(*at) <= OWN_REFLECTIONS_DISTANCE.powi(2)
                             && state
                                 .playing_since
                                 .iter()
@@ -474,6 +522,28 @@ pub fn update_acoustics(
             }
             if to == occluding.len() {
                 state.round = None;
+                // The sources near another: its acoustics.
+                for &(id, to) in &state.aliases {
+                    if let Some(&(_, result)) = state.results.iter().find(|r| r.0 == to) {
+                        state.results.push((id, result));
+                        if layers.any()
+                            && let Some(at) = state
+                                .debug_round
+                                .iter()
+                                .find(|s| s.id == to)
+                                .map(|s| s.at)
+                        {
+                            state.debug_round.push(debug::DebugSource {
+                                id,
+                                at,
+                                acoustics: result,
+                                trace: debug::SourceTrace::default(),
+                                path_legs: Vec::new(),
+                                own_reflections: false,
+                            });
+                        }
+                    }
+                }
                 acoustics::publish(&state.results);
                 if state.reverb {
                     reflections::submit_listener(listener);
@@ -748,6 +818,7 @@ fn take_voices(
                 step: f64::from(*source_rate) / f64::from(rate) * f64::from(c.pitch.max(0.0)),
                 source_gain,
                 stereo,
+                at: (!c.relative && !stereo).then_some(at),
             });
             if let Some((samples, _, source_channels)) = &c.samples {
                 sources.push(TakenSource {

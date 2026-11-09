@@ -79,6 +79,9 @@ pub struct RendererStats {
     pub positional: usize,
     pub binaural: usize,
     pub paths: usize,
+    /// Sources heard in another's binaural voice, near it (`horizon::group_radius`): the binaural voices are
+    /// `binaural`, and they play `binaural + grouped` sources.
+    pub grouped: usize,
     /// The binaural budget: the configuration's and what the load allows now.
     pub budget: usize,
     pub limit: usize,
@@ -598,8 +601,8 @@ pub fn panel(
                 ));
                 lines.push((
                     format!(
-                        "Бинаурально: {} (бюджет {}, сейчас {}), путей {}",
-                        r.binaural, r.budget, r.limit, r.paths
+                        "Бинаурально: {} (бюджет {}, сейчас {}), путей {}, слито {}",
+                        r.binaural, r.budget, r.limit, r.paths, r.grouped
                     ),
                     TEXT,
                 ));
@@ -624,8 +627,8 @@ pub fn panel(
                 ));
                 lines.push((
                     format!(
-                        "Binaural: {} (budget {}, now {}), paths {}",
-                        r.binaural, r.budget, r.limit, r.paths
+                        "Binaural: {} (budget {}, now {}), paths {}, merged {}",
+                        r.binaural, r.budget, r.limit, r.paths, r.grouped
                     ),
                     TEXT,
                 ));
@@ -973,7 +976,7 @@ mod tests {
         let panel_ru = panel(Some(&scene), Some(&renderer), Some(&stats), &paths, "ru_ru");
         let text: Vec<&str> = panel_ru.iter().map(|(t, _)| t.as_str()).collect();
         assert!(
-            text.contains(&"Бинаурально: 8 (бюджет 32, сейчас 24), путей 1"),
+            text.contains(&"Бинаурально: 8 (бюджет 32, сейчас 24), путей 1, слито 0"),
             "{text:?}"
         );
         assert!(

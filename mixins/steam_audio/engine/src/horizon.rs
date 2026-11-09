@@ -355,6 +355,79 @@ pub struct Voice {
     /// A two-channel sound (music...): Horizon plays it as it is, left and right, unattenuated and unpanned
     /// (`direction` is `None`, `pan` unused). Its samples are read interleaved.
     pub stereo: bool,
+    /// Where it is in the world, for a source with a place (`None`: relative to the listener, or not known). Sources
+    /// near one another (the splashes of a waterfall, rain on the ground nearby) are rendered as one binaural voice:
+    /// [`group_radius`].
+    pub at: Option<[f64; 3]>,
+}
+
+/// How near a source must be to another, `distance` blocks from the listener, to be heard with it as one binaural
+/// voice: a quarter of the distance (from there, a few degrees apart at most), never more than [`GROUP_RADIUS`]. Next
+/// to the listener, sources stay apart. The world's acoustics take the same groups' sources as one too.
+pub fn group_radius(distance: f64) -> f64 {
+    (GROUP_SPREAD * distance).min(GROUP_RADIUS)
+}
+
+/// See [`group_radius`].
+pub const GROUP_RADIUS: f64 = 2.5;
+const GROUP_SPREAD: f64 = 0.25;
+/// A source stays in its group while it is within this many times the group radius of where the group is: a source
+/// leaving its group starts a binaural voice of its own, which can be heard as a click.
+const GROUP_STAY: f64 = 2.0;
+
+/// No group ([`Renderer::voice_group`]).
+const NO_GROUP: usize = usize::MAX;
+
+/// Sources near one another rendered as one binaural voice ([`group_radius`]): one EQ, one HRTF convolution and one way
+/// round the walls for all of them, from their loudness-weighted direction. The state between frames is the group's,
+/// under its key: the id of the source that started it, which it keeps after that source has stopped.
+#[derive(Debug)]
+struct Group {
+    key: u64,
+    /// The members' gains this callback (it is chosen for the binaural budget by them) and whether one of them is
+    /// heard round the walls (a second binaural voice).
+    weight: f32,
+    path: bool,
+    /// Whether it is rendered binaurally this callback.
+    chosen: bool,
+    /// What the members bring to this frame: their samples, each at its gain; their gains; their direct band gains,
+    /// directions, and ways round (band gains, the loudest one's gain and direction), each weighted by its gain.
+    mix: AudioBuffer,
+    gain: f32,
+    direct: [f32; NUM_BANDS],
+    direction: [f32; 3],
+    round: [f32; NUM_BANDS],
+    round_loudest: f32,
+    round_direction: Option<[f32; 3]>,
+}
+
+impl Group {
+    fn new() -> Self {
+        Self {
+            key: 0,
+            weight: 0.0,
+            path: false,
+            chosen: false,
+            mix: AudioBuffer::new(1, FRAME_SIZE),
+            gain: 0.0,
+            direct: [0.0; NUM_BANDS],
+            direction: [0.0; 3],
+            round: [0.0; NUM_BANDS],
+            round_loudest: 0.0,
+            round_direction: None,
+        }
+    }
+
+    /// Nothing brought to the frame yet.
+    fn clear_frame(&mut self) {
+        self.mix.make_silent();
+        self.gain = 0.0;
+        self.direct = [0.0; NUM_BANDS];
+        self.direction = [0.0; 3];
+        self.round = [0.0; NUM_BANDS];
+        self.round_loudest = 0.0;
+        self.round_direction = None;
+    }
 }
 
 /// What a source's samples are, for [`Renderer::render`]: fills `out` with the source's samples resampled at `step`
@@ -462,6 +535,18 @@ pub struct Renderer {
     binaural: Vec<bool>,
     playing: Vec<bool>,
     order: Vec<usize>,
+    /// Each source's group this callback ([`NO_GROUP`] for none), the groups (the first `group_count`; the rest are
+    /// kept for later callbacks, with their buffers), and the groups in order of loudness.
+    voice_group: Vec<usize>,
+    groups: Vec<Group>,
+    group_count: usize,
+    group_order: Vec<usize>,
+    /// Across callbacks: each source's group key, and where each group that sources can join is (where the source
+    /// that started it is, or was last). The `next_` ones are filled for this callback, then swapped in.
+    memberships: HashMap<u64, u64>,
+    anchors: HashMap<u64, [f64; 3]>,
+    next_memberships: HashMap<u64, u64>,
+    next_anchors: HashMap<u64, (usize, Option<[f64; 3]>)>,
     mono: AudioBuffer,
     /// A source's samples before the direct path's EQ, for its path round the walls.
     dry: AudioBuffer,
@@ -578,6 +663,14 @@ impl Renderer {
             binaural: Vec::new(),
             playing: Vec::new(),
             order: Vec::new(),
+            voice_group: Vec::new(),
+            groups: Vec::new(),
+            group_count: 0,
+            group_order: Vec::new(),
+            memberships: HashMap::new(),
+            anchors: HashMap::new(),
+            next_memberships: HashMap::new(),
+            next_anchors: HashMap::new(),
             mono: AudioBuffer::new(1, FRAME_SIZE),
             dry: AudioBuffer::new(1, FRAME_SIZE),
             stereo: AudioBuffer::new(2, FRAME_SIZE),
@@ -680,13 +773,13 @@ impl Renderer {
                 .iter()
                 .filter(|v| v.direction.is_some() && v.gain > 0.0)
                 .count();
-            s.binaural = self.order.len();
-            s.paths = self
-                .order
-                .iter()
-                .filter(|&&i| {
+            let chosen = || self.groups[..self.group_count].iter().filter(|g| g.chosen);
+            s.binaural = chosen().count();
+            s.grouped = self.order.len() - s.binaural.min(self.order.len());
+            s.paths = chosen()
+                .filter(|g| {
                     self.states
-                        .get(&self.voices[i].id)
+                        .get(&g.key)
                         .is_some_and(|state| state.path.is_some())
                 })
                 .count();
@@ -733,42 +826,146 @@ impl Renderer {
     /// The sources rendered binaurally: the loudest with a direction, within the budget, where a source with a way
     /// round the walls counts twice (its path is a second binaural voice). The budget is the configuration's, lowered
     /// while the audio thread is busy ([`Renderer::measure_load`]).
+    ///
+    /// Sources near one another go as one ([`group_radius`]): they count once, by their gains together.
     fn choose_binaural(&mut self) {
+        self.group_sources();
         let voices = &self.voices;
-        let paths = self.config.occlusion && self.config.pathing;
-        let acoustics = &self.acoustics;
-        let cost = |i: usize| {
-            1 + usize::from(
-                paths
-                    && acoustics
-                        .get(voices[i].id)
-                        .is_some_and(|a| a.path_gain() > 0.0),
-            )
-        };
+        let groups = &mut self.groups[..self.group_count];
         let budget = self.config.max_binaural_voices.min(self.voice_limit);
-        self.order.clear();
-        self.order.extend(
-            (0..voices.len()).filter(|&i| voices[i].direction.is_some() && voices[i].gain > 0.0),
-        );
-        self.order
-            .sort_unstable_by(|&a, &b| voices[b].gain.total_cmp(&voices[a].gain));
+        self.group_order.clear();
+        self.group_order.extend(0..groups.len());
+        self.group_order
+            .sort_unstable_by(|&a, &b| groups[b].weight.total_cmp(&groups[a].weight));
         let mut used = 0;
-        let mut kept = 0;
-        for k in 0..self.order.len() {
-            let c = cost(self.order[k]);
-            if used + c > budget {
-                continue;
+        for &g in &self.group_order {
+            let c = 1 + usize::from(groups[g].path);
+            groups[g].chosen = used + c <= budget;
+            if groups[g].chosen {
+                used += c;
             }
-            used += c;
-            self.order[kept] = self.order[k];
-            kept += 1;
         }
-        self.order.truncate(kept);
+        self.order.clear();
         self.binaural.clear();
         self.binaural.resize(voices.len(), false);
-        for &i in &self.order {
-            self.binaural[i] = true;
+        for i in 0..voices.len() {
+            let g = self.voice_group[i];
+            if g != NO_GROUP && groups[g].chosen {
+                self.binaural[i] = true;
+                self.order.push(i);
+            }
         }
+        self.order
+            .sort_unstable_by(|&a, &b| voices[b].gain.total_cmp(&voices[a].gain));
+    }
+
+    /// Puts this callback's sources with a direction in groups ([`Renderer::voice_group`]). A source keeps its group
+    /// while it stays near where the group is; a new source joins the nearest group within [`group_radius`] of it, or
+    /// starts one of its own. A source that already plays on its own never joins another group: its binaural voice
+    /// would start over, which can be heard.
+    fn group_sources(&mut self) {
+        let paths = self.config.occlusion && self.config.pathing;
+        let Self {
+            voices,
+            acoustics,
+            voice_group,
+            groups,
+            group_count,
+            group_order,
+            memberships,
+            anchors,
+            next_memberships,
+            next_anchors,
+            ..
+        } = self;
+        voice_group.clear();
+        voice_group.resize(voices.len(), NO_GROUP);
+        next_memberships.clear();
+        next_anchors.clear();
+        *group_count = 0;
+        // The oldest first (ids grow): groups are started by the sources that came first.
+        group_order.clear();
+        group_order.extend(
+            (0..voices.len()).filter(|&i| voices[i].direction.is_some() && voices[i].gain > 0.0),
+        );
+        group_order.sort_unstable_by_key(|&i| voices[i].id);
+        let near = |a: [f64; 3], b: [f64; 3], r: f64| {
+            (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>() <= r * r
+        };
+        for &i in group_order.iter() {
+            let v = &voices[i];
+            let radius = group_radius(f64::from(v.distance));
+            let previous = memberships.get(&v.id).copied();
+            let key = match v.at {
+                None => v.id,
+                Some(at) => match previous {
+                    // Its own group, or one it is still near.
+                    Some(key)
+                        if key == v.id
+                            || next_anchors
+                                .get(&key)
+                                .and_then(|(_, a)| *a)
+                                .or_else(|| anchors.get(&key).copied())
+                                .is_some_and(|a| near(at, a, GROUP_STAY * radius)) =>
+                    {
+                        key
+                    }
+                    // It left its group: a voice of its own.
+                    Some(_) => v.id,
+                    // New: the nearest group it can join, or its own.
+                    None => next_anchors
+                        .iter()
+                        .filter_map(|(&key, &(_, a))| {
+                            let a = a?;
+                            let d2 = (0..3).map(|k| (at[k] - a[k]).powi(2)).sum::<f64>();
+                            (d2 <= radius * radius).then_some((key, d2))
+                        })
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .map_or(v.id, |(key, _)| key),
+                },
+            };
+            let g = match next_anchors.get(&key) {
+                Some(&(g, _)) => g,
+                None => {
+                    let g = *group_count;
+                    *group_count += 1;
+                    if groups.len() < *group_count {
+                        groups.push(Group::new());
+                    }
+                    let group = &mut groups[g];
+                    group.key = key;
+                    group.weight = 0.0;
+                    group.path = false;
+                    group.chosen = false;
+                    // Where the group is: where its first source is, or was last; none for a source without a place.
+                    let anchor = v.at.and(if key == v.id {
+                        v.at
+                    } else {
+                        anchors.get(&key).copied().or(v.at)
+                    });
+                    next_anchors.insert(key, (g, anchor));
+                    g
+                }
+            };
+            // The source that started the group moves it with it.
+            if key == v.id
+                && let Some(entry) = next_anchors.get_mut(&key)
+                && v.at.is_some()
+            {
+                entry.1 = v.at;
+            }
+            voice_group[i] = g;
+            groups[g].weight += v.gain;
+            groups[g].path |= paths && acoustics.get(v.id).is_some_and(|a| a.path_gain() > 0.0);
+            next_memberships.insert(v.id, key);
+        }
+        std::mem::swap(memberships, next_memberships);
+        anchors.clear();
+        anchors.extend(
+            next_anchors
+                .iter()
+                .filter_map(|(&key, &(_, a))| Some((key, a?))),
+        );
     }
 
     fn render_frame(&mut self, read: &mut ReadSource<'_>) {
@@ -784,6 +981,9 @@ impl Renderer {
             voices,
             binaural,
             playing,
+            voice_group,
+            groups,
+            group_count,
             mono,
             dry,
             stereo,
@@ -835,6 +1035,10 @@ impl Renderer {
         for r in source_reverbs.values_mut() {
             r.input.make_silent();
             r.sent = false;
+        }
+        let groups = &mut groups[..*group_count];
+        for g in groups.iter_mut().filter(|g| g.chosen) {
+            g.clear_frame();
         }
         for (i, voice) in voices.iter().enumerate() {
             if !playing[i] {
@@ -919,10 +1123,76 @@ impl Renderer {
             };
             match (binaural[i], voice.direction) {
                 (true, Some(direction)) => {
-                    let state = states.entry(voice.id).or_insert_with(|| VoiceState {
+                    // To its group's binaural voice, rendered once all have brought their part (below).
+                    let g = &mut groups[voice_group[i]];
+                    let w = voice.gain;
+                    for (m, &s) in g.mix.channel_mut(0).iter_mut().zip(mono.channel(0)) {
+                        *m += s * w;
+                    }
+                    g.gain += w;
+                    let length = direction.iter().map(|c| c * c).sum::<f32>().sqrt();
+                    if length > 0.0 {
+                        for (d, c) in g.direction.iter_mut().zip(direction) {
+                            *d += w * c / length;
+                        }
+                    }
+                    for (d, e) in g.direct.iter_mut().zip(eq_gains) {
+                        *d += w * e * overall;
+                    }
+                    if let Some((eq, gain, direction)) = path {
+                        for (r, e) in g.round.iter_mut().zip(eq) {
+                            *r += w * gain * e;
+                        }
+                        if w * gain > g.round_loudest {
+                            g.round_loudest = w * gain;
+                            g.round_direction = Some(direction);
+                        }
+                    }
+                }
+                _ => {
+                    // Beyond the binaural budget: Horizon's panning, with the walls' and the air's mean loss, and
+                    // the way round's mean gain.
+                    let mean = |g: &[f32; NUM_BANDS]| g.iter().sum::<f32>() / NUM_BANDS as f32;
+                    let loss = mean(&eq_gains) * overall
+                        + path.map_or(0.0, |(eq, gain, _)| mean(&eq) * gain);
+                    let [left, right] = voice.pan.map(|pan| pan * voice.gain * loss);
+                    for (out, &s) in block.chunks_exact_mut(2).zip(mono.channel(0)) {
+                        out[0] += s * left;
+                        out[1] += s * right;
+                    }
+                }
+            }
+        }
+        // The groups' binaural voices: their members' samples (at their gains, over their gains together), with their
+        // weighted band gains, from their weighted direction. A group of one is its source as it is.
+        for g in groups.iter_mut().filter(|g| g.chosen && g.gain > 0.0) {
+            let inverse = g.gain.recip();
+            for s in g.mix.channel_mut(0) {
+                *s *= inverse;
+            }
+            let mut eq_gains: [f32; NUM_BANDS] = std::array::from_fn(|b| g.direct[b] * inverse);
+            let mut overall = 1.0;
+            EqEffect::normalize_gains(&mut eq_gains, &mut overall);
+            let length = g.direction.iter().map(|c| c * c).sum::<f32>().sqrt();
+            let direction = if length > 1e-6 {
+                g.direction.map(|c| c / length)
+            } else {
+                [0.0, 0.0, -1.0]
+            };
+            let path = g.round_direction.map(|direction| {
+                let mut eq: [f32; NUM_BANDS] = std::array::from_fn(|b| g.round[b] * inverse);
+                let mut overall = 1.0;
+                EqEffect::normalize_gains(&mut eq, &mut overall);
+                (eq, overall, direction)
+            });
+            let voice_gain = g.gain;
+            let mono = &mut g.mix;
+            {
+                {
+                    let state = states.entry(g.key).or_insert_with(|| VoiceState {
                         binaural: BinauralEffect::new(settings, hrtf),
                         eq: EqEffect::new(settings),
-                        gain: voice.gain * overall,
+                        gain: voice_gain * overall,
                         frame,
                         path: None,
                     });
@@ -931,7 +1201,7 @@ impl Renderer {
                         dry.channel_mut(0).copy_from_slice(mono.channel(0));
                     }
                     state.eq.apply_in_place(&eq_gains, mono);
-                    let gain = voice.gain * overall;
+                    let gain = voice_gain * overall;
                     ramp(mono.channel_mut(0), state.gain, gain);
                     state.gain = gain;
                     let mut params = BinauralParams::new(Vector3::from_array(direction), hrtf);
@@ -957,7 +1227,7 @@ impl Renderer {
                             });
                             p.eq_gains = eq;
                             p.direction = direction;
-                            voice.gain * gain
+                            voice_gain * gain
                         }
                         None => 0.0,
                     };
@@ -981,18 +1251,6 @@ impl Renderer {
                         if silent {
                             state.path = None;
                         }
-                    }
-                }
-                _ => {
-                    // Beyond the binaural budget: Horizon's panning, with the walls' and the air's mean loss, and
-                    // the way round's mean gain.
-                    let mean = |g: &[f32; NUM_BANDS]| g.iter().sum::<f32>() / NUM_BANDS as f32;
-                    let loss = mean(&eq_gains) * overall
-                        + path.map_or(0.0, |(eq, gain, _)| mean(&eq) * gain);
-                    let [left, right] = voice.pan.map(|pan| pan * voice.gain * loss);
-                    for (out, &s) in block.chunks_exact_mut(2).zip(mono.channel(0)) {
-                        out[0] += s * left;
-                        out[1] += s * right;
                     }
                 }
             }
@@ -1378,6 +1636,7 @@ mod tests {
             step: 1.0,
             source_gain: 0.8,
             stereo: true,
+            at: None,
         });
         renderer.render(&mut out, 2, &mut |_, step, buf| {
             assert_eq!(buf.len(), 2 * FRAME_SIZE);
@@ -1414,6 +1673,7 @@ mod tests {
             step: 1.0,
             source_gain: 0.5,
             stereo: false,
+            at: None,
         });
         renderer.render(&mut out, 2, &mut |id, step, buf| {
             assert_eq!(id, 7);
@@ -1628,6 +1888,7 @@ mod tests {
                     step: 1.0,
                     source_gain: 0.3,
                     stereo: false,
+                    at: None,
                 });
             }
         };
@@ -1715,6 +1976,7 @@ mod tests {
                     step: 1.0,
                     source_gain: 0.3,
                     stereo: false,
+                    at: None,
                 });
             }
             let t = std::time::Instant::now();
@@ -1785,6 +2047,7 @@ mod tests {
             step: 1.0,
             source_gain: 0.5,
             stereo: false,
+            at: None,
         });
         renderer.render(&mut out, 2, &mut |_, step, buf| {
             read_linear(&tone, 0.0, step, true, buf);
@@ -1840,6 +2103,7 @@ mod tests {
                 step: 1.0,
                 source_gain: 0.5,
                 stereo: false,
+                at: None,
             });
         }
         renderer.acoustics.update();
@@ -1847,6 +2111,130 @@ mod tests {
         let chosen: Vec<usize> = (0..32).filter(|&i| renderer.binaural[i]).collect();
         // 32 voices' budget: 16 sources with their ways round, the loudest.
         assert_eq!(chosen, (0..16).collect::<Vec<_>>());
+    }
+
+    /// A source `distance` blocks ahead of a listener at the origin looking down -Z, `side` blocks to its right.
+    fn placed(id: u64, distance: f32, side: f32) -> Voice {
+        let d = (distance * distance + side * side).sqrt();
+        Voice {
+            id,
+            gain: 0.5,
+            pan: [0.5, 0.5],
+            direction: Some([side / d, 0.0, -distance / d]),
+            distance: d,
+            step: 1.0,
+            source_gain: 0.5,
+            stereo: false,
+            at: Some([f64::from(side), 0.0, -f64::from(distance)]),
+        }
+    }
+
+    /// Renders `voices` for `frames` frames of noise (each its own) and returns the output.
+    fn render_noise(renderer: &mut Renderer, voices: &[Voice], frames: usize) -> Vec<f32> {
+        let mut out = vec![0.0; 2 * frames * FRAME_SIZE];
+        let mut seeds: HashMap<u64, u32> = voices
+            .iter()
+            .map(|v| (v.id, 0x9e37_79b9 ^ v.id as u32))
+            .collect();
+        renderer.begin(1);
+        for v in voices {
+            renderer.push(*v);
+        }
+        renderer.render(&mut out, 2, &mut |id, _, buf| {
+            let seed = seeds.get_mut(&id).expect("a pushed source");
+            for s in buf.iter_mut() {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 17;
+                *seed ^= *seed << 5;
+                *s = *seed as f32 / u32::MAX as f32 - 0.5;
+            }
+            true
+        });
+        out
+    }
+
+    #[test]
+    fn sources_near_one_another_are_one_binaural_voice() {
+        let mut renderer =
+            Renderer::new(48_000, Config::default()).expect("built-in HRTF at 48 kHz");
+        // A waterfall 12 blocks ahead: splashes within a block of one another; another 8 blocks to the right of it;
+        // and two sounds at the listener's feet, half a block apart (too near the ears to go together).
+        let mut voices: Vec<Voice> = (0..10).map(|i| placed(i, 12.0, i as f32 * 0.1)).collect();
+        voices.push(placed(20, 12.0, 8.0));
+        voices.push(placed(30, 1.0, 0.0));
+        voices.push(placed(31, 1.0, 0.5));
+        render_noise(&mut renderer, &voices, 2);
+        assert_eq!(renderer.states.len(), 4, "{:?}", renderer.states.keys());
+        for key in [0, 20, 30, 31] {
+            assert!(renderer.states.contains_key(&key), "group {key}");
+        }
+        assert_eq!(renderer.order.len(), voices.len());
+
+        // The source that started the waterfall's group stops: the group goes on as it was.
+        render_noise(&mut renderer, &voices[1..], 2);
+        assert!(renderer.states.contains_key(&0));
+        assert!(!renderer.states.contains_key(&1));
+
+        // A new splash there joins it; one that has played on its own does not.
+        let mut more = voices[1..].to_vec();
+        more.push(placed(40, 12.0, 0.5));
+        render_noise(&mut renderer, &more, 1);
+        assert_eq!(renderer.memberships.get(&40), Some(&0));
+        assert_eq!(renderer.memberships.get(&20), Some(&20));
+        more.iter_mut().find(|v| v.id == 20).expect("source 20").at = Some([0.4, 0.0, -12.0]);
+        render_noise(&mut renderer, &more, 1);
+        assert_eq!(renderer.memberships.get(&20), Some(&20));
+
+        // A splash carried away from its group (farther than it may stay) gets a voice of its own.
+        more.iter_mut().find(|v| v.id == 40).expect("source 40").at = Some([7.0, 0.0, -12.0]);
+        render_noise(&mut renderer, &more, 1);
+        assert_eq!(renderer.memberships.get(&40), Some(&40));
+    }
+
+    #[test]
+    fn a_group_of_one_sounds_as_its_source_alone() {
+        let voice = placed(5, 6.0, 2.0);
+        let mut alone = Renderer::new(48_000, Config::default()).expect("built-in HRTF at 48 kHz");
+        let mut grouped =
+            Renderer::new(48_000, Config::default()).expect("built-in HRTF at 48 kHz");
+        let a = render_noise(&mut alone, &[Voice { at: None, ..voice }], 4);
+        let b = render_noise(&mut grouped, &[voice], 4);
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 1e-5, "{worst}");
+    }
+
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_waterfall_load() {
+        // 24 splashes of a waterfall 10 blocks ahead, within two blocks: apart, then as the renderer groups them.
+        let splashes: Vec<Voice> = (0..24)
+            .map(|i| placed(i, 10.0 + (i % 4) as f32 * 0.3, (i / 4) as f32 * 0.3))
+            .collect();
+        for grouping in [false, true] {
+            let voices: Vec<Voice> = splashes
+                .iter()
+                .map(|v| Voice {
+                    at: if grouping { v.at } else { None },
+                    ..*v
+                })
+                .collect();
+            let mut renderer =
+                Renderer::new(48_000, Config::default()).expect("built-in HRTF at 48 kHz");
+            render_noise(&mut renderer, &voices, 10);
+            let start = std::time::Instant::now();
+            render_noise(&mut renderer, &voices, 200);
+            let per_frame = start.elapsed() / 200;
+            let frame = std::time::Duration::from_secs_f64(FRAME_SIZE as f64 / 48_000.0);
+            println!(
+                "grouping {grouping}: {per_frame:?} per frame, {:.1}% of a core, {} binaural voices",
+                per_frame.as_secs_f64() / frame.as_secs_f64() * 100.0,
+                renderer.states.len()
+            );
+        }
     }
 
     #[test]

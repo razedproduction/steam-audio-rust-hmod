@@ -1,6 +1,6 @@
 [mod]
 id = "steam_audio"
-version = "0.9.0"
+version = "0.9.1"
 
 [compatibility]
 # Nightly 2026-11-08 (tag nightly-source/2026-11-08-fdc87ae).
