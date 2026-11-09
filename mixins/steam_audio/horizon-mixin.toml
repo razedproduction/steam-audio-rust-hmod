@@ -1,10 +1,10 @@
 [mod]
 id = "steam_audio"
-version = "0.7.3"
+version = "0.8.0"
 
 [compatibility]
-# Nightly 2026-11-04 (tag nightly-source/2026-11-04-6475f62).
-horizon_revision = "6475f62f3c834b7489e1816bf47f47ea5eb2b879"
+# Nightly 2026-11-08 (tag nightly-source/2026-11-08-fdc87ae).
+horizon_revision = "fdc87aecdbd116bf1e08adcd062fcbaea8c2e2ca"
 
 # `horizon_client_render::audio::steam_audio`: the mod's output stream, its Steam Audio rendering of Horizon's
 # mixer and the world's acoustics (see the top of output.rs). Public for the frame hook in horizon-client.
@@ -67,6 +67,28 @@ bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "mod_id", ty = "&str", value = "mod_id" },
   { name = "button", ty = "usize", value = "button" },
+]
+
+# The visual debug mode (`steam_audio_hmod::debug`, each layer a button of the settings page): its world layers over
+# the frame once the world is drawn, its labels and statistics panel on the HUD.
+[[injection]]
+id = "debug-world"
+hook = "world_drawn"
+hook_version = 1
+kind = "HEAD"
+helper = "world_drawn.rs"
+bindings = [{ name = "world", ty = "&mut WorldDrawn<'_>", value = "&mut *world" }]
+
+[[injection]]
+id = "debug-hud"
+hook = "hud"
+hook_version = 1
+kind = "HEAD"
+helper = "hud.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "batch", ty = "&mut HudBatch", value = "&mut *batch" },
+  { name = "corners", ty = "&mut Corners", value = "&mut *corners" },
 ]
 
 # steam-audio-rust, vendored, plus the renderer (`steam_audio_hmod::horizon`).

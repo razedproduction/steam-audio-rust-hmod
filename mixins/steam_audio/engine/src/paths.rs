@@ -229,6 +229,26 @@ impl Paths {
     /// (the caller asks for occluded sources). `None` when there is none: either is outside the grid or sees no
     /// probe, or no baked path joins their probes.
     pub fn find(&self, listener: [f64; 3], source: [f64; 3]) -> Option<PathAcoustics> {
+        self.find_traced(listener, source, None)
+    }
+
+    /// Where the probes stand (world).
+    pub fn probe_positions(&self) -> Vec<[f64; 3]> {
+        self.batch
+            .probes()
+            .iter()
+            .map(|p| self.grid.to_world(p.influence.center))
+            .collect()
+    }
+
+    /// [`Paths::find`], and with `legs` the legs of the paths it found, probe to probe (world, each once), for the
+    /// debug mode ([`crate::debug`]).
+    pub fn find_traced(
+        &self,
+        listener: [f64; 3],
+        source: [f64; 3],
+        legs: Option<&mut Vec<([f64; 3], [f64; 3])>>,
+    ) -> Option<PathAcoustics> {
         let listener = self.grid.free_point(self.grid.to_local(listener))?;
         let source = self.grid.free_point(self.grid.to_local(source))?;
         let batches = [&self.batch];
@@ -258,6 +278,19 @@ impl Paths {
             force_direct_occlusion: true,
         };
         let mut sh = [0.0f32; 1];
+        // Without validation the simulator only reports each leg of the paths it takes, as visible.
+        let grid = &self.grid;
+        let mut record = legs.map(|legs| {
+            move |a: Vector3, b: Vector3, _: bool| {
+                let leg = (grid.to_world(a), grid.to_world(b));
+                if !legs
+                    .iter()
+                    .any(|l| *l == leg || (l.0 == leg.1 && l.1 == leg.0))
+                {
+                    legs.push(leg);
+                }
+            }
+        });
         let result = self.simulator.find_paths(
             &*self.grid,
             &batches,
@@ -266,7 +299,9 @@ impl Paths {
             &listener_probes,
             &params,
             &mut sh,
-            None,
+            record
+                .as_mut()
+                .map(|r| r as &mut dyn FnMut(Vector3, Vector3, bool)),
         )?;
         // The paths' total weight: 1 when every pair of probes around the two is joined.
         let weight = sh[0] / Y00;
@@ -363,6 +398,10 @@ fn run_thread() {
         last_run = Some((started, started.elapsed()));
         match result {
             Ok(paths) => {
+                crate::debug::publish_paths(
+                    paths.as_ref().map_or(0, Paths::num_probes),
+                    started.elapsed(),
+                );
                 if let Ok(mut latest) = LATEST.lock() {
                     *latest = paths.map(Arc::new);
                 }
@@ -452,6 +491,25 @@ mod tests {
         assert!(path.gain > 0.3 && path.gain <= 1.0, "{path:?}");
         // Bending round the doorway takes more off the high frequencies.
         assert!(path.eq[2] <= path.eq[0], "{path:?}");
+        // The debug mode's legs: the same path, through probes in both rooms, and one leg through the doorway.
+        let mut legs = Vec::new();
+        assert_eq!(
+            paths.find_traced(listener, source, Some(&mut legs)),
+            Some(path)
+        );
+        assert!(!legs.is_empty());
+        let crosses = |a: f64, b: f64| (a < 0.0) != (b < 0.0);
+        assert!(
+            legs.iter()
+                .any(|(a, b)| crosses(a[0], b[0]) && a[2] < 0.0 && b[2] < 0.0),
+            "{legs:?}"
+        );
+        let probes = paths.probe_positions();
+        assert_eq!(probes.len(), paths.num_probes());
+        assert!(
+            legs.iter()
+                .all(|(a, b)| probes.contains(a) && probes.contains(b))
+        );
 
         // Without the doorway the rooms are sealed: no path.
         let sealed = Paths::bake(grid(listener, two_rooms(None)), &pool).expect("probes");

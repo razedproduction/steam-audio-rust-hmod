@@ -18,11 +18,53 @@
 //! waits for the game thread.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::bands::NUM_BANDS;
 use crate::paths::PathAcoustics;
 use crate::scene::Material;
+
+/// Steam Audio's presets' scattering: how much of what a surface reflects goes off in every direction (1) rather
+/// than mirror-like (0).
+pub const DEFAULT_SCATTERING: f32 = 0.05;
+
+/// How the reflecting surfaces are tuned on the settings page: what the reflection simulation's materials are.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceTuning {
+    /// Factor on every preset's absorption (1: Steam Audio's values; more: duller, shorter reverb).
+    pub absorption: f32,
+    /// Every surface's scattering (Steam Audio's presets: [`DEFAULT_SCATTERING`]).
+    pub scattering: f32,
+}
+
+impl Default for SurfaceTuning {
+    fn default() -> Self {
+        Self {
+            absorption: 1.0,
+            scattering: DEFAULT_SCATTERING,
+        }
+    }
+}
+
+static TUNING_ABSORPTION: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
+static TUNING_SCATTERING: AtomicU32 = AtomicU32::new(DEFAULT_SCATTERING.to_bits());
+
+impl SurfaceTuning {
+    /// The game's current tuning (set with the configuration, [`crate::horizon::Config::set`]).
+    pub fn current() -> Self {
+        Self {
+            absorption: f32::from_bits(TUNING_ABSORPTION.load(Ordering::Relaxed)),
+            scattering: f32::from_bits(TUNING_SCATTERING.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Makes `self` the game's tuning; the reflection simulation starts over with it.
+    pub fn publish(self) {
+        TUNING_ABSORPTION.store(self.absorption.to_bits(), Ordering::Relaxed);
+        TUNING_SCATTERING.store(self.scattering.to_bits(), Ordering::Relaxed);
+    }
+}
 
 /// What a wall is made of: Steam Audio's material presets (its Unity and Unreal plugins' `Generic`, `Brick`...),
 /// and three of the mod's own for what is not a full block of something.
@@ -93,9 +135,20 @@ impl Surface {
         };
         Material {
             absorption,
-            scattering: 0.05,
+            scattering: DEFAULT_SCATTERING,
             transmission,
         }
+    }
+
+    /// Its material for the reflections with the settings page's `tuning`: absorption scaled (at most 1), scattering
+    /// the page's. Transmission is the preset's.
+    pub fn tuned_material(self, tuning: SurfaceTuning) -> Material {
+        let mut m = self.material();
+        for a in &mut m.absorption {
+            *a = (*a * tuning.absorption).clamp(0.0, 1.0);
+        }
+        m.scattering = tuning.scattering.clamp(0.0, 1.0);
+        m
     }
 
     /// The surface of a block from its id (`minecraft:white_concrete`) and its break sound
@@ -494,6 +547,18 @@ pub fn source_acoustics_shaped(
     source: [f64; 3],
     settings: &AcousticsSettings,
 ) -> SourceAcoustics {
+    source_acoustics_traced(wall, listener, source, settings, None)
+}
+
+/// [`source_acoustics_shaped`], and with `trace` what it looked at, for the debug mode ([`crate::debug`]): each ray
+/// and whether it got through, the walls and the leaves or fences on the line of sight.
+pub fn source_acoustics_traced(
+    wall: &mut impl FnMut([i32; 3]) -> Option<(Surface, Option<Shape>)>,
+    listener: [f64; 3],
+    source: [f64; 3],
+    settings: &AcousticsSettings,
+    mut trace: Option<&mut crate::debug::SourceTrace>,
+) -> SourceAcoustics {
     // What of the cell `c` the segment `from` → `to` meets.
     let mut wall = |c: [i32; 3], from: [f64; 3], to: [f64; 3]| -> Option<Surface> {
         let (surface, shape) = wall(c)?;
@@ -530,6 +595,9 @@ pub fn source_acoustics_shaped(
             clear
         });
         seen += u32::from(clear);
+        if let Some(t) = trace.as_deref_mut() {
+            t.rays.push((point, clear));
+        }
     }
     let occlusion = if aimed == 0 {
         0.0
@@ -554,6 +622,9 @@ pub fn source_acoustics_shaped(
                     *t *= coefficient.max(1e-4).powf(settings.transmission_exponent);
                 }
                 walls += 1;
+                if let Some(t) = trace.as_deref_mut() {
+                    t.walls.push(c);
+                }
             }
             Some(surface) if !surface.is_solid() && filters < MAX_FILTERS => {
                 let m = surface.material();
@@ -561,6 +632,9 @@ pub fn source_acoustics_shaped(
                     *t *= coefficient.max(1e-4).powf(settings.transmission_exponent);
                 }
                 filters += 1;
+                if let Some(t) = trace.as_deref_mut() {
+                    t.filters.push(c);
+                }
             }
             _ => {}
         }
@@ -747,6 +821,31 @@ mod tests {
     }
 
     #[test]
+    fn the_trace_shows_the_rays_and_the_walls() {
+        let settings = AcousticsSettings::default();
+        let (listener, source) = ([0.5, 64.6, 0.5], [8.5, 64.5, 0.5]);
+        // A stone wall at x = 3 and a hedge at x = 5, both across the line of sight.
+        let mut world = |c: [i32; 3]| match c[0] {
+            3 if (63..=66).contains(&c[1]) && c[2].abs() <= 2 => Some((Surface::Rock, None)),
+            5 => Some((Surface::Foliage, None)),
+            _ => None,
+        };
+        let mut trace = crate::debug::SourceTrace::default();
+        let traced =
+            source_acoustics_traced(&mut world, listener, source, &settings, Some(&mut trace));
+        assert_eq!(
+            traced,
+            source_acoustics_shaped(&mut world, listener, source, &settings)
+        );
+        // The six rays, all blocked; the wall and the hedge on the line of sight.
+        assert_eq!(trace.rays.len(), 6);
+        assert!(trace.rays.iter().all(|(_, clear)| !clear), "{trace:?}");
+        assert_eq!(trace.rays[0].0, source);
+        assert_eq!(trace.walls, vec![[3, 64, 0]]);
+        assert_eq!(trace.filters, vec![[5, 64, 0]]);
+    }
+
+    #[test]
     fn a_corner_occludes_partly() {
         let settings = AcousticsSettings::default();
         // A wall whose edge is at the line of sight: some rays pass beside it.
@@ -756,6 +855,27 @@ mod tests {
             partial.occlusion > 0.0 && partial.occlusion < 1.0,
             "{partial:?}"
         );
+    }
+
+    #[test]
+    fn the_settings_page_tunes_the_reflecting_surfaces() {
+        assert_eq!(
+            Surface::Wood.tuned_material(SurfaceTuning::default()),
+            Surface::Wood.material()
+        );
+        let tuned = Surface::Gravel.tuned_material(SurfaceTuning {
+            absorption: 2.0,
+            scattering: 0.5,
+        });
+        // Gravel absorbs 0.6, 0.7, 0.8: doubled, at most everything.
+        assert_eq!(tuned.absorption, [1.0, 1.0, 1.0]);
+        assert_eq!(tuned.scattering, 0.5);
+        assert_eq!(tuned.transmission, Surface::Gravel.material().transmission);
+        let brick = Surface::Brick.tuned_material(SurfaceTuning {
+            absorption: 0.5,
+            scattering: 0.05,
+        });
+        assert!((brick.absorption[0] - 0.015).abs() < 1e-6);
     }
 
     #[test]

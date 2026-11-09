@@ -23,7 +23,7 @@ BUNDLE = ROOT / "mixins" / MOD_ID
 # Minecraft version of the pinned Horizon commit (`horizon_core::version::VERSION_ID`).
 GAME = "26.3"
 # horizon-mixins revision the pinned Horizon launcher builds with (`launcher/src/native_mods.rs` `MIXINS_REV`).
-MIXINS_REV = "e8cd0aa38cffef49cb2e088ef716baa107148c02"
+MIXINS_REV = "5a64af938ec86b00d53d16a408aabc0038fb3e57"
 
 NOTICE_NAMES = ("README", "LICENSE", "LICENCE", "COPYING", "NOTICE")
 SKIPPED_DIRS = {"target", ".git", ".local", "node_modules"}

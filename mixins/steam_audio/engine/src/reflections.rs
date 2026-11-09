@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use crate::acoustics::Surface;
+use crate::acoustics::{Surface, SurfaceTuning};
 use crate::air_absorption::AirAbsorptionModel;
 use crate::bands::NUM_BANDS;
 use crate::directivity::Directivity;
@@ -123,6 +123,11 @@ impl Voxels {
     pub fn to_local(&self, position: [f64; 3]) -> Vector3 {
         let p: [f32; 3] = std::array::from_fn(|a| (position[a] - f64::from(self.origin[a])) as f32);
         Vector3::from_array(p)
+    }
+
+    /// A position relative to the grid's corner, in the world ([`Voxels::to_local`] the other way).
+    pub fn to_world(&self, local: Vector3) -> [f64; 3] {
+        std::array::from_fn(|a| f64::from(local[a]) + f64::from(self.origin[a]))
     }
 
     /// The wall at world block `cell`, if any (none outside the grid).
@@ -297,6 +302,26 @@ impl Voxels {
     }
 }
 
+/// [`Voxels`] with the settings page's materials ([`SurfaceTuning`]): what the reflection simulation traces.
+struct Tuned<'a> {
+    voxels: &'a Voxels,
+    materials: &'a [Material; Surface::ALL.len()],
+}
+
+impl RayTracer for Tuned<'_> {
+    fn closest_hit(&self, ray: &Ray, min_distance: f32, max_distance: f32) -> Hit {
+        let mut hit = self.voxels.closest_hit(ray, min_distance, max_distance);
+        if let Some(surface) = hit.material_index {
+            hit.material = Some(self.materials[surface]);
+        }
+        hit
+    }
+
+    fn any_hit(&self, ray: &Ray, min_distance: f32, max_distance: f32) -> bool {
+        self.voxels.any_hit(ray, min_distance, max_distance)
+    }
+}
+
 /// A cell's code: only walls ([`Surface::is_solid`]) are kept; rays go through leaves and fences.
 fn encode(surface: Option<Surface>) -> u8 {
     surface.filter(|s| s.is_solid()).map_or(0, |s| {
@@ -454,6 +479,9 @@ pub struct Simulation {
     /// The grid and the listener position (world) the accumulated fields are for.
     last: Option<(Arc<Voxels>, [f64; 3])>,
     sources: Vec<SourceState>,
+    /// The surfaces' tuning the accumulated fields are for, and the materials it gives.
+    tuning: SurfaceTuning,
+    materials: [Material; Surface::ALL.len()],
 }
 
 impl Simulation {
@@ -483,6 +511,8 @@ impl Simulation {
             air: AirAbsorptionModel::default(),
             last: None,
             sources: Vec::new(),
+            tuning: SurfaceTuning::default(),
+            materials: *MATERIALS,
         }
     }
 
@@ -502,7 +532,10 @@ impl Simulation {
         listener: [f64; 3],
         sources: &[(u64, [f64; 3])],
     ) -> bool {
-        if !self.same(grid, listener) || self.runs < MAX_RUNS {
+        if !self.same(grid, listener)
+            || self.runs < MAX_RUNS
+            || SurfaceTuning::current() != self.tuning
+        {
             return true;
         }
         let usable = usable_sources(grid, sources);
@@ -534,11 +567,17 @@ impl Simulation {
         if !grid.contains(position) {
             return None;
         }
-        if !self.same(grid, listener) {
+        // A new place, or surfaces tuned otherwise on the settings page: the averages start over.
+        let tuning = SurfaceTuning::current();
+        if !self.same(grid, listener) || tuning != self.tuning {
             self.runs = 0;
             self.last = Some((Arc::clone(grid), listener));
             for state in &mut self.sources {
                 state.runs = 0;
+            }
+            if tuning != self.tuning {
+                self.tuning = tuning;
+                self.materials = Surface::ALL.map(|s| s.tuned_material(tuning));
             }
         }
         // Each source keeps its average while it stays put; new ones start one.
@@ -585,8 +624,12 @@ impl Simulation {
             order: ORDER,
             irradiance_min_distance: 1.0,
         };
+        let scene = Tuned {
+            voxels: grid,
+            materials: &self.materials,
+        };
         self.simulator.simulate(
-            &**grid,
+            &scene,
             &params,
             &mut self.fields[..spaces.len()],
             &self.pool,
@@ -887,6 +930,19 @@ fn run_thread() {
         last_run = Some((started, started.elapsed()));
         match result {
             Ok(Some(reflections)) => {
+                crate::debug::publish_reflections(crate::debug::ReflectionStats {
+                    runs: simulation.runs,
+                    max_runs: MAX_RUNS,
+                    last_run: Some(started.elapsed()),
+                    reverb_times: Some(reflections.reverb.reverb_times),
+                    sources: simulation
+                        .sources
+                        .iter()
+                        .zip(&reflections.sources)
+                        .map(|(s, (_, ir))| (s.id, s.position, s.runs, ir.reverb.reverb_times))
+                        .collect(),
+                    at: Some(Instant::now()),
+                });
                 if let Ok(mut output) = OUTPUT.lock()
                     && let Some(old) = output.replace(Box::new(reflections))
                 {

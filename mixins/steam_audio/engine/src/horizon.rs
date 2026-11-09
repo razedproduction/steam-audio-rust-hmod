@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
-use crate::acoustics::{AcousticsSettings, Snapshot};
+use crate::acoustics::{AcousticsSettings, Snapshot, SurfaceTuning};
 use crate::air_absorption::AirAbsorptionModel;
 use crate::audio_buffer::{AudioBuffer, AudioEffectState, AudioSettings};
 use crate::bands::NUM_BANDS;
@@ -82,30 +82,72 @@ pub struct Config {
     /// `HORIZON_STEAM_AUDIO_DISTANCE=vanilla`: Horizon's linear distance attenuation, silent at the sound's range
     /// (16 blocks for a mob). By default it is physical ([`distance_gain`]): a mob is heard across a large cave.
     pub physical_distance: bool,
+    /// `HORIZON_STEAM_AUDIO_RANGE=x` (2 to 8, default [`PHYSICAL_RANGE`]): with physical attenuation, how many of
+    /// Horizon's ranges a source is heard across.
+    pub hearing_range: f32,
+    /// `HORIZON_STEAM_AUDIO_SOURCE_VOLUME=x` (0 to 2, default 1): volume of the sounds of the world (those with a
+    /// place; music and the UI keep theirs).
+    pub source_volume: f32,
+    /// `HORIZON_STEAM_AUDIO_ABSORPTION=x` (0 to 4, default 1): factor on how much the surfaces absorb what reaches
+    /// them, for the reflections and the reverb ([`SurfaceTuning`]).
+    pub absorption: f32,
+    /// `HORIZON_STEAM_AUDIO_SCATTERING=x` (0 to 1, default 0.05, Steam Audio's presets): how much of what the
+    /// surfaces reflect goes off in every direction rather than mirror-like ([`SurfaceTuning`]).
+    pub scattering: f32,
+    /// The visual debug layers ([`crate::debug`]), each its own button on the settings page and off by default:
+    /// the sources with their occlusion rays and walls, the paths round the walls and their probes, the reflection
+    /// grid with sample reflection rays and the sources with reflections of their own, and the statistics panel.
+    pub debug_sources: bool,
+    pub debug_paths: bool,
+    pub debug_reflections: bool,
+    pub debug_stats: bool,
 }
 
-/// How far a sound with Horizon's range `linear` is heard with physical attenuation: four times its range.
+impl Config {
+    /// Whether any visual debug layer is on.
+    pub fn debugging(&self) -> bool {
+        self.debug_sources || self.debug_paths || self.debug_reflections || self.debug_stats
+    }
+
+    /// How far sources reach, in Horizon's ranges, for [`distance_gain`] and [`audible_range`]: `None` with
+    /// Horizon's attenuation.
+    pub fn reach(&self) -> Option<f32> {
+        self.physical_distance.then_some(self.hearing_range)
+    }
+
+    /// The reflecting surfaces' tuning.
+    pub fn surfaces(&self) -> SurfaceTuning {
+        SurfaceTuning {
+            absorption: self.absorption,
+            scattering: self.scattering,
+        }
+    }
+}
+
+/// How far a sound with Horizon's range `linear` is heard with physical attenuation by default: four times its range
+/// ([`Config::hearing_range`]).
 pub const PHYSICAL_RANGE: f32 = 4.0;
 
-/// The distance attenuation of a source with Horizon's `linear` range (`None`: not attenuated) at `distance`.
+/// The distance attenuation of a source with Horizon's `linear` range (`None`: not attenuated) at `distance`, with
+/// `reach` ([`Config::reach`]).
 ///
-/// Horizon's (`physical == false`) is OpenAL's linear model, `1 − d / range`, silent at the range. The physical one
+/// Horizon's (`reach == None`) is OpenAL's linear model, `1 − d / range`, silent at the range. The physical one
 /// is Steam Audio's inverse distance, `r₀ / d`, with the reference distance `r₀` a quarter of the range: full
 /// volume up close, the same as Horizon's at half the range, a quarter (−12 dB) at the range instead of silence,
-/// and fading out smoothly over the last quarter before [`PHYSICAL_RANGE`] ranges.
-pub fn distance_gain(linear: Option<f32>, distance: f32, physical: bool) -> f32 {
+/// and fading out smoothly over the last quarter before `reach` ranges ([`PHYSICAL_RANGE`] by default).
+pub fn distance_gain(linear: Option<f32>, distance: f32, reach: Option<f32>) -> f32 {
     let Some(range) = linear else {
         return 1.0;
     };
     if range <= 0.0 {
         return 0.0;
     }
-    if !physical {
+    let Some(reach) = reach else {
         return (1.0 - distance.min(range) / range).clamp(0.0, 1.0);
-    }
+    };
     let reference = (range / 4.0).max(1.0);
     let inverse = (reference / distance.max(1e-3)).min(1.0);
-    let end = range * PHYSICAL_RANGE;
+    let end = range * reach.max(1.0);
     let fade_from = end * 0.75;
     let fade = if distance <= fade_from {
         1.0
@@ -117,14 +159,8 @@ pub fn distance_gain(linear: Option<f32>, distance: f32, physical: bool) -> f32 
 }
 
 /// How far a source with Horizon's range `linear` can be heard (`None`: everywhere).
-pub fn audible_range(linear: Option<f32>, physical: bool) -> Option<f32> {
-    linear.map(|range| {
-        if physical {
-            range * PHYSICAL_RANGE
-        } else {
-            range
-        }
-    })
+pub fn audible_range(linear: Option<f32>, reach: Option<f32>) -> Option<f32> {
+    linear.map(|range| reach.map_or(range, |reach| range * reach.max(1.0)))
 }
 
 impl Default for Config {
@@ -143,6 +179,14 @@ impl Default for Config {
             reverb_level: 0.5,
             underwater: true,
             physical_distance: true,
+            hearing_range: PHYSICAL_RANGE,
+            source_volume: 1.0,
+            absorption: 1.0,
+            scattering: crate::acoustics::DEFAULT_SCATTERING,
+            debug_sources: false,
+            debug_paths: false,
+            debug_reflections: false,
+            debug_stats: false,
         }
     }
 }
@@ -199,6 +243,26 @@ impl Config {
             &mut self.reverb_level,
         );
         number(
+            "HORIZON_STEAM_AUDIO_RANGE",
+            2.0..=8.0,
+            &mut self.hearing_range,
+        );
+        number(
+            "HORIZON_STEAM_AUDIO_SOURCE_VOLUME",
+            0.0..=2.0,
+            &mut self.source_volume,
+        );
+        number(
+            "HORIZON_STEAM_AUDIO_ABSORPTION",
+            0.0..=4.0,
+            &mut self.absorption,
+        );
+        number(
+            "HORIZON_STEAM_AUDIO_SCATTERING",
+            0.0..=1.0,
+            &mut self.scattering,
+        );
+        number(
             "HORIZON_STEAM_AUDIO_VOLUME_DB",
             -24.0..=24.0,
             &mut self.volume_db,
@@ -243,6 +307,7 @@ impl Config {
         let lock = live();
         let mut current = lock.write().unwrap_or_else(|e| e.into_inner());
         ENABLED.store(config.enabled, Ordering::Relaxed);
+        config.surfaces().publish();
         *current = config;
         VERSION.fetch_add(1, Ordering::Release);
     }
@@ -261,6 +326,7 @@ fn live() -> &'static RwLock<Config> {
     LIVE.get_or_init(|| {
         let config = Config::from_vars(|name| std::env::var(name).ok());
         ENABLED.store(config.enabled, Ordering::Relaxed);
+        config.surfaces().publish();
         RwLock::new(config)
     })
 }
@@ -283,11 +349,15 @@ pub struct Voice {
     /// The source's gain without distance attenuation (0 when no camera hears it): what it sends to reflections
     /// simulated from where it is, which attenuate with distance themselves.
     pub source_gain: f32,
+    /// A two-channel sound (music...): Horizon plays it as it is, left and right, unattenuated and unpanned
+    /// (`direction` is `None`, `pan` unused). Its samples are read interleaved.
+    pub stereo: bool,
 }
 
-/// What a source's samples are, for [`Renderer::render`]: fills `out` with the source's mono samples resampled at
-/// `step` source samples per output sample, advancing its position, and returns whether it still plays (a stopped
-/// source fills the rest with silence).
+/// What a source's samples are, for [`Renderer::render`]: fills `out` with the source's samples resampled at `step`
+/// source samples per output sample, advancing its position, and returns whether it still plays (a stopped source
+/// fills the rest with silence). `out` is one frame of mono samples, or of interleaved stereo ones for a
+/// [`Voice::stereo`] source.
 pub type ReadSource<'a> = dyn FnMut(u64, f64, &mut [f32]) -> bool + 'a;
 
 /// A source rendered binaurally: its effects' state between frames.
@@ -393,6 +463,8 @@ pub struct Renderer {
     /// A source's samples before the direct path's EQ, for its path round the walls.
     dry: AudioBuffer,
     stereo: AudioBuffer,
+    /// A two-channel source's frame, interleaved ([`Voice::stereo`]).
+    interleaved: Vec<f32>,
     /// The world acoustics published by the game thread.
     acoustics: Snapshot,
     /// The reverb bus: what the sources send it (faded to the reverb level the last frame ended at), Steam Audio's
@@ -506,6 +578,7 @@ impl Renderer {
             mono: AudioBuffer::new(1, FRAME_SIZE),
             dry: AudioBuffer::new(1, FRAME_SIZE),
             stereo: AudioBuffer::new(2, FRAME_SIZE),
+            interleaved: vec![0.0; 2 * FRAME_SIZE],
             block: vec![0.0; 2 * FRAME_SIZE],
             taken: FRAME_SIZE,
             frame: 0,
@@ -589,6 +662,41 @@ impl Renderer {
             frame[1] = self.block[2 * self.taken + 1];
             self.taken += 1;
         }
+        if self.config.debugging() {
+            self.publish_debug();
+        }
+    }
+
+    /// What this callback rendered, for the debug mode's statistics and labels ([`crate::debug`]).
+    fn publish_debug(&self) {
+        crate::debug::publish_renderer(|s| {
+            s.rate = self.rate;
+            s.voices = self.voices.len();
+            s.positional = self
+                .voices
+                .iter()
+                .filter(|v| v.direction.is_some() && v.gain > 0.0)
+                .count();
+            s.binaural = self.order.len();
+            s.paths = self
+                .order
+                .iter()
+                .filter(|&&i| {
+                    self.states
+                        .get(&self.voices[i].id)
+                        .is_some_and(|state| state.path.is_some())
+                })
+                .count();
+            s.budget = self.config.max_binaural_voices;
+            s.limit = self.config.max_binaural_voices.min(self.voice_limit);
+            s.load = self.load;
+            s.source_reverbs = self.source_reverbs.len();
+            s.wet = self.wet;
+            s.underwater = self.underwater;
+            s.binaural_ids.clear();
+            s.binaural_ids
+                .extend(self.order.iter().map(|&i| self.voices[i].id));
+        });
     }
 
     /// Follows how long frames take to render, relative to how long they play: when the audio thread gets near its
@@ -676,6 +784,7 @@ impl Renderer {
             mono,
             dry,
             stereo,
+            interleaved,
             acoustics,
             reverb_in,
             ambisonics,
@@ -726,6 +835,17 @@ impl Renderer {
         }
         for (i, voice) in voices.iter().enumerate() {
             if !playing[i] {
+                continue;
+            }
+            if voice.stereo {
+                // Two channels (music...): as Horizon plays them, left and right as they are, dry.
+                playing[i] = read(voice.id, voice.step, interleaved);
+                if voice.gain != 0.0 {
+                    for (out, s) in block.chunks_exact_mut(2).zip(interleaved.chunks_exact(2)) {
+                        out[0] += s[0] * voice.gain;
+                        out[1] += s[1] * voice.gain;
+                    }
+                }
                 continue;
             }
             playing[i] = read(voice.id, voice.step, mono.channel_mut(0));
@@ -1088,24 +1208,41 @@ fn ramp(samples: &mut [f32], from: f32, to: f32) {
 /// plays; after it stops, `out` is silent.
 pub fn read_linear(
     samples: &[f32],
+    position: f64,
+    step: f64,
+    looping: bool,
+    out: &mut [f32],
+) -> (f64, bool) {
+    read_frames(samples, 1, position, step, looping, out)
+}
+
+/// [`read_linear`] for a source of `channels` interleaved channels (`position` and `step` in frames): fills `out`,
+/// interleaved too, a frame at a time.
+pub fn read_frames(
+    samples: &[f32],
+    channels: usize,
     mut position: f64,
     step: f64,
     looping: bool,
     out: &mut [f32],
 ) -> (f64, bool) {
-    for (k, o) in out.iter_mut().enumerate() {
+    let channels = channels.max(1);
+    let frames = samples.len() / channels;
+    for (k, o) in out.chunks_exact_mut(channels).enumerate() {
         let mut i = position as usize;
-        if i + 1 >= samples.len() {
-            if looping && samples.len() > 1 {
+        if i + 1 >= frames {
+            if looping && frames > 1 {
                 position = 0.0;
                 i = 0;
             } else {
-                out[k..].fill(0.0);
+                out[k * channels..].fill(0.0);
                 return (position, false);
             }
         }
         let t = (position - i as f64) as f32;
-        *o = samples[i] * (1.0 - t) + samples[i + 1] * t;
+        for (c, o) in o.iter_mut().enumerate() {
+            *o = samples[i * channels + c] * (1.0 - t) + samples[(i + 1) * channels + c] * t;
+        }
         position += step;
     }
     (position, true)
@@ -1206,6 +1343,49 @@ mod tests {
         let (_, playing) = read_linear(&samples, 2.0, 1.0, true, &mut out);
         assert!(playing);
         assert_eq!(out, [2.0, 0.0, 1.0, 2.0]);
+
+        // Two interleaved channels: frames (0, 10), (1, 11), (2, 12).
+        let stereo = [0.0, 10.0, 1.0, 11.0, 2.0, 12.0];
+        let mut out = [9.0; 4];
+        let (position, playing) = read_frames(&stereo, 2, 0.0, 0.5, false, &mut out);
+        assert_eq!(out, [0.0, 10.0, 0.5, 10.5]);
+        assert_eq!((position, playing), (1.0, true));
+        let (_, playing) = read_frames(&stereo, 2, 1.0, 1.0, false, &mut out);
+        assert!(!playing);
+        assert_eq!(out, [1.0, 11.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn stereo_sources_play_as_they_are() {
+        let mut renderer =
+            Renderer::new(48_000, Config::default()).expect("built-in HRTF at 48 kHz");
+        // Left channel all 0.25, right all -0.5: they come out as they are, at the gain.
+        let music: Vec<f32> = (0..2 * 48_000)
+            .map(|i| if i % 2 == 0 { 0.25 } else { -0.5 })
+            .collect();
+        let mut position = 0.0;
+        let mut out = vec![0.0; 2 * 4 * FRAME_SIZE];
+        renderer.begin(1);
+        renderer.push(Voice {
+            id: 3,
+            gain: 0.8,
+            pan: [0.0, 0.0],
+            direction: None,
+            distance: 0.0,
+            step: 1.0,
+            source_gain: 0.8,
+            stereo: true,
+        });
+        renderer.render(&mut out, 2, &mut |_, step, buf| {
+            assert_eq!(buf.len(), 2 * FRAME_SIZE);
+            let (p, playing) = read_frames(&music, 2, position, step, true, buf);
+            position = p;
+            playing
+        });
+        let last = &out[out.len() - 2..];
+        assert!((last[0] - 0.2).abs() < 1e-6, "{last:?}");
+        assert!((last[1] + 0.4).abs() < 1e-6, "{last:?}");
+        assert!(renderer.states.is_empty());
     }
 
     /// Renders broadband noise from `direction` and returns the energy of each ear.
@@ -1230,6 +1410,7 @@ mod tests {
             distance: 4.0,
             step: 1.0,
             source_gain: 0.5,
+            stereo: false,
         });
         renderer.render(&mut out, 2, &mut |id, step, buf| {
             assert_eq!(id, 7);
@@ -1389,21 +1570,25 @@ mod tests {
     fn physical_distance_attenuation_reaches_past_the_range() {
         let mob = Some(16.0);
         // Horizon's: silent at the range.
-        assert_eq!(distance_gain(mob, 16.0, false), 0.0);
-        assert!((distance_gain(mob, 8.0, false) - 0.5).abs() < 1e-6);
+        assert_eq!(distance_gain(mob, 16.0, None), 0.0);
+        assert!((distance_gain(mob, 8.0, None) - 0.5).abs() < 1e-6);
         // Physical: full up close, the same at half the range, then a long tail fading out at four ranges.
-        assert_eq!(distance_gain(mob, 2.0, true), 1.0);
-        assert!((distance_gain(mob, 8.0, true) - 0.5).abs() < 1e-6);
-        assert!((distance_gain(mob, 16.0, true) - 0.25).abs() < 1e-6);
-        assert!((distance_gain(mob, 32.0, true) - 0.125).abs() < 1e-6);
+        assert_eq!(distance_gain(mob, 2.0, Some(PHYSICAL_RANGE)), 1.0);
+        assert!((distance_gain(mob, 8.0, Some(PHYSICAL_RANGE)) - 0.5).abs() < 1e-6);
+        assert!((distance_gain(mob, 16.0, Some(PHYSICAL_RANGE)) - 0.25).abs() < 1e-6);
+        assert!((distance_gain(mob, 32.0, Some(PHYSICAL_RANGE)) - 0.125).abs() < 1e-6);
         let tail: Vec<f32> = (40..=64)
-            .map(|d| distance_gain(mob, d as f32, true))
+            .map(|d| distance_gain(mob, d as f32, Some(PHYSICAL_RANGE)))
             .collect();
         assert!(tail.windows(2).all(|w| w[1] <= w[0]), "{tail:?}");
-        assert_eq!(distance_gain(mob, 64.0, true), 0.0);
-        assert_eq!(distance_gain(None, 100.0, true), 1.0);
-        assert_eq!(audible_range(mob, true), Some(64.0));
-        assert_eq!(audible_range(mob, false), Some(16.0));
+        assert_eq!(distance_gain(mob, 64.0, Some(PHYSICAL_RANGE)), 0.0);
+        assert_eq!(distance_gain(None, 100.0, Some(PHYSICAL_RANGE)), 1.0);
+        assert_eq!(audible_range(mob, Some(PHYSICAL_RANGE)), Some(64.0));
+        assert_eq!(audible_range(mob, None), Some(16.0));
+        // A shorter or longer reach on the settings page.
+        assert_eq!(audible_range(mob, Some(2.0)), Some(32.0));
+        assert_eq!(distance_gain(mob, 32.0, Some(2.0)), 0.0);
+        assert!(distance_gain(mob, 64.0, Some(8.0)) > 0.0);
     }
 
     /// The audio thread's load: 32 voices for a second of sound, with the listener's reverb only and with
@@ -1439,6 +1624,7 @@ mod tests {
                     distance: 4.0 + id as f32,
                     step: 1.0,
                     source_gain: 0.3,
+                    stereo: false,
                 });
             }
         };
@@ -1525,6 +1711,7 @@ mod tests {
                     distance: 4.0 + (id % 32) as f32,
                     step: 1.0,
                     source_gain: 0.3,
+                    stereo: false,
                 });
             }
             let t = std::time::Instant::now();
@@ -1594,6 +1781,7 @@ mod tests {
             distance: 4.0,
             step: 1.0,
             source_gain: 0.5,
+            stereo: false,
         });
         renderer.render(&mut out, 2, &mut |_, step, buf| {
             read_linear(&tone, 0.0, step, true, buf);
@@ -1648,6 +1836,7 @@ mod tests {
                 distance: 4.0,
                 step: 1.0,
                 source_gain: 0.5,
+                stereo: false,
             });
         }
         renderer.acoustics.update();
