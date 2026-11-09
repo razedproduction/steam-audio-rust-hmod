@@ -18,7 +18,6 @@
 //! waits for the game thread.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::bands::NUM_BANDS;
@@ -29,7 +28,7 @@ use crate::scene::Material;
 /// than mirror-like (0).
 pub const DEFAULT_SCATTERING: f32 = 0.05;
 
-/// How the reflecting surfaces are tuned on the settings page: what the reflection simulation's materials are.
+/// How every reflecting surface is tuned on the advanced settings page ([`crate::materials::Palette`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurfaceTuning {
     /// Factor on every preset's absorption (1: Steam Audio's values; more: duller, shorter reverb).
@@ -47,50 +46,48 @@ impl Default for SurfaceTuning {
     }
 }
 
-static TUNING_ABSORPTION: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
-static TUNING_SCATTERING: AtomicU32 = AtomicU32::new(DEFAULT_SCATTERING.to_bits());
+/// What a wall is made of: one of Steam Audio's material presets (its Unity and Unreal plugins' `Generic`,
+/// `Brick`...) and three of the mod's own for what is not a full block of something, or a *variant* of a preset the
+/// settings page made for a block tuned on its own ([`crate::materials`]): a code, the presets first.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Surface(u8);
 
-impl SurfaceTuning {
-    /// The game's current tuning (set with the configuration, [`crate::horizon::Config::set`]).
-    pub fn current() -> Self {
-        Self {
-            absorption: f32::from_bits(TUNING_ABSORPTION.load(Ordering::Relaxed)),
-            scattering: f32::from_bits(TUNING_SCATTERING.load(Ordering::Relaxed)),
-        }
-    }
-
-    /// Makes `self` the game's tuning; the reflection simulation starts over with it.
-    pub fn publish(self) {
-        TUNING_ABSORPTION.store(self.absorption.to_bits(), Ordering::Relaxed);
-        TUNING_SCATTERING.store(self.scattering.to_bits(), Ordering::Relaxed);
-    }
+#[allow(non_upper_case_globals)]
+impl Surface {
+    pub const Generic: Surface = Surface(0);
+    pub const Brick: Surface = Surface(1);
+    pub const Concrete: Surface = Surface(2);
+    pub const Ceramic: Surface = Surface(3);
+    pub const Gravel: Surface = Surface(4);
+    pub const Carpet: Surface = Surface(5);
+    pub const Glass: Surface = Surface(6);
+    pub const Plaster: Surface = Surface(7);
+    pub const Wood: Surface = Surface(8);
+    pub const Metal: Surface = Surface(9);
+    pub const Rock: Surface = Surface(10);
+    /// Water: its surface reflects almost everything, and little crosses it.
+    pub const Water: Surface = Surface(11);
+    /// Leaves: sound goes through, losing its highs on the way; nothing to reflect off.
+    pub const Foliage: Surface = Surface(12);
+    /// Fences, panes, bars, chains, walls: thin, sound goes through and round them almost whole.
+    pub const Thin: Surface = Surface(13);
 }
 
-/// What a wall is made of: Steam Audio's material presets (its Unity and Unreal plugins' `Generic`, `Brick`...),
-/// and three of the mod's own for what is not a full block of something.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum Surface {
-    Generic,
-    Brick,
-    Concrete,
-    Ceramic,
-    Gravel,
-    Carpet,
-    Glass,
-    Plaster,
-    Wood,
-    Metal,
-    Rock,
-    /// Water: its surface reflects almost everything, and little crosses it.
-    Water,
-    /// Leaves: sound goes through, losing its highs on the way; nothing to reflect off.
-    Foliage,
-    /// Fences, panes, bars, chains, walls: thin, sound goes through and round them almost whole.
-    Thin,
+impl std::fmt::Debug for Surface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const NAMES: [&str; 14] = [
+            "Generic", "Brick", "Concrete", "Ceramic", "Gravel", "Carpet", "Glass", "Plaster",
+            "Wood", "Metal", "Rock", "Water", "Foliage", "Thin",
+        ];
+        match NAMES.get(usize::from(self.0)) {
+            Some(name) => f.write_str(name),
+            None => write!(f, "Variant({}, of {:?})", self.0, self.base()),
+        }
+    }
 }
 
 impl Surface {
+    /// The presets, in code order.
     pub const ALL: [Surface; 14] = [
         Self::Generic,
         Self::Brick,
@@ -108,20 +105,48 @@ impl Surface {
         Self::Thin,
     ];
 
+    /// Its code (a preset's is its index in [`Surface::ALL`]).
+    pub const fn code(self) -> u8 {
+        self.0
+    }
+
+    /// The surface of code `code`.
+    pub const fn from_code(code: u8) -> Self {
+        Self(code)
+    }
+
+    /// Whether it is one of the presets (not a block's variant of one).
+    pub const fn is_preset(self) -> bool {
+        (self.0 as usize) < Self::ALL.len()
+    }
+
+    /// The preset it is a variant of (a preset is its own).
+    pub fn base(self) -> Surface {
+        if self.is_preset() {
+            self
+        } else {
+            crate::materials::base_of(self)
+        }
+    }
+
     /// Whether it is a wall: it blocks rays (occlusion, reflections, the probes' sight). Foliage and thin blocks
     /// are not: they only filter the sound that goes through them.
     pub fn is_solid(self) -> bool {
-        !matches!(self, Self::Foliage | Self::Thin)
+        !matches!(self.base(), Self::Foliage | Self::Thin)
     }
 
-    /// Steam Audio's preset: absorption (low, mid, high), scattering, transmission (low, mid, high). For foliage
-    /// and thin blocks, transmission is what one block lets through.
+    /// Its material as the settings page tunes it (the palette's; with the defaults, its preset's).
     pub fn material(self) -> Material {
-        let (absorption, transmission) = match self {
+        crate::materials::material_of(self)
+    }
+
+    /// Steam Audio's preset of its base: absorption (low, mid, high), scattering, transmission (low, mid, high). For
+    /// foliage and thin blocks, transmission is what one block lets through.
+    pub fn preset(self) -> Material {
+        let (absorption, transmission) = match self.base() {
             Self::Water => ([0.01, 0.01, 0.02], [0.030, 0.030, 0.030]),
             Self::Foliage => ([0.20, 0.40, 0.60], [0.90, 0.75, 0.55]),
             Self::Thin => ([0.10, 0.10, 0.10], [0.97, 0.94, 0.90]),
-            Self::Generic => ([0.10, 0.20, 0.30], [0.100, 0.050, 0.030]),
             Self::Brick => ([0.03, 0.04, 0.07], [0.015, 0.015, 0.015]),
             Self::Concrete => ([0.05, 0.07, 0.08], [0.015, 0.002, 0.001]),
             Self::Ceramic => ([0.01, 0.02, 0.02], [0.060, 0.044, 0.011]),
@@ -132,23 +157,13 @@ impl Surface {
             Self::Wood => ([0.11, 0.07, 0.06], [0.070, 0.014, 0.005]),
             Self::Metal => ([0.20, 0.07, 0.06], [0.200, 0.025, 0.010]),
             Self::Rock => ([0.13, 0.20, 0.24], [0.015, 0.002, 0.001]),
+            _ => ([0.10, 0.20, 0.30], [0.100, 0.050, 0.030]),
         };
         Material {
             absorption,
             scattering: DEFAULT_SCATTERING,
             transmission,
         }
-    }
-
-    /// Its material for the reflections with the settings page's `tuning`: absorption scaled (at most 1), scattering
-    /// the page's. Transmission is the preset's.
-    pub fn tuned_material(self, tuning: SurfaceTuning) -> Material {
-        let mut m = self.material();
-        for a in &mut m.absorption {
-            *a = (*a * tuning.absorption).clamp(0.0, 1.0);
-        }
-        m.scattering = tuning.scattering.clamp(0.0, 1.0);
-        m
     }
 
     /// The surface of a block from its id (`minecraft:white_concrete`) and its break sound
@@ -855,27 +870,6 @@ mod tests {
             partial.occlusion > 0.0 && partial.occlusion < 1.0,
             "{partial:?}"
         );
-    }
-
-    #[test]
-    fn the_settings_page_tunes_the_reflecting_surfaces() {
-        assert_eq!(
-            Surface::Wood.tuned_material(SurfaceTuning::default()),
-            Surface::Wood.material()
-        );
-        let tuned = Surface::Gravel.tuned_material(SurfaceTuning {
-            absorption: 2.0,
-            scattering: 0.5,
-        });
-        // Gravel absorbs 0.6, 0.7, 0.8: doubled, at most everything.
-        assert_eq!(tuned.absorption, [1.0, 1.0, 1.0]);
-        assert_eq!(tuned.scattering, 0.5);
-        assert_eq!(tuned.transmission, Surface::Gravel.material().transmission);
-        let brick = Surface::Brick.tuned_material(SurfaceTuning {
-            absorption: 0.5,
-            scattering: 0.05,
-        });
-        assert!((brick.absorption[0] - 0.015).abs() < 1e-6);
     }
 
     #[test]

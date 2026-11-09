@@ -94,6 +94,8 @@ pub struct Config {
     /// `HORIZON_STEAM_AUDIO_SCATTERING=x` (0 to 1, default 0.05, Steam Audio's presets): how much of what the
     /// surfaces reflect goes off in every direction rather than mirror-like ([`SurfaceTuning`]).
     pub scattering: f32,
+    /// The settings page's materials and blocks ([`crate::materials`]): kept by the page only.
+    pub tuning: std::sync::Arc<crate::materials::Tuning>,
     /// The visual debug layers ([`crate::debug`]), each its own button on the settings page and off by default:
     /// the sources with their occlusion rays and walls, the paths round the walls and their probes, the reflection
     /// grid with sample reflection rays and the sources with reflections of their own, and the statistics panel.
@@ -183,6 +185,7 @@ impl Default for Config {
             source_volume: 1.0,
             absorption: 1.0,
             scattering: crate::acoustics::DEFAULT_SCATTERING,
+            tuning: std::sync::Arc::default(),
             debug_sources: false,
             debug_paths: false,
             debug_reflections: false,
@@ -307,7 +310,7 @@ impl Config {
         let lock = live();
         let mut current = lock.write().unwrap_or_else(|e| e.into_inner());
         ENABLED.store(config.enabled, Ordering::Relaxed);
-        config.surfaces().publish();
+        crate::materials::publish(&config);
         *current = config;
         VERSION.fetch_add(1, Ordering::Release);
     }
@@ -326,7 +329,7 @@ fn live() -> &'static RwLock<Config> {
     LIVE.get_or_init(|| {
         let config = Config::from_vars(|name| std::env::var(name).ok());
         ENABLED.store(config.enabled, Ordering::Relaxed);
-        config.surfaces().publish();
+        crate::materials::publish(&config);
         RwLock::new(config)
     })
 }

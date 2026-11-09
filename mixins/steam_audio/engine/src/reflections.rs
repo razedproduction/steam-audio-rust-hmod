@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use crate::acoustics::{Surface, SurfaceTuning};
+use crate::acoustics::Surface;
 use crate::air_absorption::AirAbsorptionModel;
 use crate::bands::NUM_BANDS;
 use crate::directivity::Directivity;
@@ -80,13 +80,9 @@ pub const MIN_INTERVAL: Duration = Duration::from_millis(250);
 pub struct Voxels {
     origin: [i32; 3],
     size: [usize; 3],
-    /// Per cell, 0 for no wall, else 1 + the index of its [`Surface`] in [`Surface::ALL`].
+    /// Per cell, 0 for no wall, else 1 + its [`Surface`]'s code.
     cells: Vec<u8>,
 }
-
-/// Steam Audio's material of each [`Surface::ALL`].
-static MATERIALS: LazyLock<[Material; Surface::ALL.len()]> =
-    LazyLock::new(|| Surface::ALL.map(Surface::material));
 
 impl Voxels {
     /// A grid with no walls, its corner at block `origin`.
@@ -135,7 +131,7 @@ impl Voxels {
         let local: [i32; 3] = std::array::from_fn(|a| cell[a] - self.origin[a]);
         self.local_index(local)
             .and_then(|i| self.cells[i].checked_sub(1))
-            .map(|s| Surface::ALL[usize::from(s)])
+            .map(Surface::from_code)
     }
 
     /// Sets the wall at world block `cell` (ignored outside the grid).
@@ -305,14 +301,15 @@ impl Voxels {
 /// [`Voxels`] with the settings page's materials ([`SurfaceTuning`]): what the reflection simulation traces.
 struct Tuned<'a> {
     voxels: &'a Voxels,
-    materials: &'a [Material; Surface::ALL.len()],
+    /// Per surface code.
+    materials: &'a [Material],
 }
 
 impl RayTracer for Tuned<'_> {
     fn closest_hit(&self, ray: &Ray, min_distance: f32, max_distance: f32) -> Hit {
         let mut hit = self.voxels.closest_hit(ray, min_distance, max_distance);
         if let Some(surface) = hit.material_index {
-            hit.material = Some(self.materials[surface]);
+            hit.material = self.materials.get(surface).copied().or(hit.material);
         }
         hit
     }
@@ -324,9 +321,9 @@ impl RayTracer for Tuned<'_> {
 
 /// A cell's code: only walls ([`Surface::is_solid`]) are kept; rays go through leaves and fences.
 fn encode(surface: Option<Surface>) -> u8 {
-    surface.filter(|s| s.is_solid()).map_or(0, |s| {
-        1 + Surface::ALL.iter().position(|&x| x == s).unwrap_or(0) as u8
-    })
+    surface
+        .filter(|s| s.is_solid())
+        .map_or(0, |s| s.code().saturating_add(1))
 }
 
 impl RayTracer for Voxels {
@@ -338,7 +335,7 @@ impl RayTracer for Voxels {
                 object_index: None,
                 material_index: Some(surface),
                 normal,
-                material: Some(MATERIALS[surface]),
+                material: Some(Surface::from_code(surface as u8).material()),
             },
             None => Hit::default(),
         }
@@ -479,9 +476,10 @@ pub struct Simulation {
     /// The grid and the listener position (world) the accumulated fields are for.
     last: Option<(Arc<Voxels>, [f64; 3])>,
     sources: Vec<SourceState>,
-    /// The surfaces' tuning the accumulated fields are for, and the materials it gives.
-    tuning: SurfaceTuning,
-    materials: [Material; Surface::ALL.len()],
+    /// The palette the accumulated fields are for ([`crate::materials::version`]), and its materials per surface
+    /// code.
+    palette: u64,
+    materials: Vec<Material>,
 }
 
 impl Simulation {
@@ -511,8 +509,8 @@ impl Simulation {
             air: AirAbsorptionModel::default(),
             last: None,
             sources: Vec::new(),
-            tuning: SurfaceTuning::default(),
-            materials: *MATERIALS,
+            palette: crate::materials::version(),
+            materials: crate::materials::palette().materials(),
         }
     }
 
@@ -534,7 +532,7 @@ impl Simulation {
     ) -> bool {
         if !self.same(grid, listener)
             || self.runs < MAX_RUNS
-            || SurfaceTuning::current() != self.tuning
+            || crate::materials::version() != self.palette
         {
             return true;
         }
@@ -568,16 +566,16 @@ impl Simulation {
             return None;
         }
         // A new place, or surfaces tuned otherwise on the settings page: the averages start over.
-        let tuning = SurfaceTuning::current();
-        if !self.same(grid, listener) || tuning != self.tuning {
+        let palette = crate::materials::version();
+        if !self.same(grid, listener) || palette != self.palette {
             self.runs = 0;
             self.last = Some((Arc::clone(grid), listener));
             for state in &mut self.sources {
                 state.runs = 0;
             }
-            if tuning != self.tuning {
-                self.tuning = tuning;
-                self.materials = Surface::ALL.map(|s| s.tuned_material(tuning));
+            if palette != self.palette {
+                self.palette = palette;
+                self.materials = crate::materials::palette().materials();
             }
         }
         // Each source keeps its average while it stays put; new ones start one.

@@ -1,6 +1,6 @@
 [mod]
 id = "steam_audio"
-version = "0.8.0"
+version = "0.9.0"
 
 [compatibility]
 # Nightly 2026-11-08 (tag nightly-source/2026-11-08-fdc87ae).
@@ -67,6 +67,20 @@ bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "mod_id", ty = "&str", value = "mod_id" },
   { name = "button", ty = "usize", value = "button" },
+]
+
+# The settings page's block search, typed on the page: each key while it is typed, and the page asked for its labels
+# again.
+[[injection]]
+id = "settings-search"
+hook = "key"
+hook_version = 1
+kind = "HEAD"
+helper = "key.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "key", ty = "&str", value = "key" },
+  { name = "pressed", ty = "bool", value = "pressed" },
 ]
 
 # The visual debug mode (`steam_audio_hmod::debug`, each layer a button of the settings page): its world layers over

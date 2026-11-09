@@ -8,10 +8,10 @@
 //! - the built-in HRTF is read from `data/cipic_124.hrtf` (generated once from upstream's `cipic_124.inl`)
 //!   instead of being produced by a build script;
 //! - SOFA support is not compiled in;
-//! - [`horizon`], [`acoustics`], [`reflections`], [`paths`], [`settings`] and [`debug`] are new: the binaural renderer
-//!   behind the mod's sound output, the world's occlusion and transmission, the reflections and reverb simulated from
-//!   the blocks, the sound paths around them, its settings page in Options > Mods, and what its visual debug mode
-//!   shows.
+//! - [`horizon`], [`acoustics`], [`reflections`], [`paths`], [`settings`], [`materials`] and [`debug`] are new: the
+//!   binaural renderer behind the mod's sound output, the world's occlusion and transmission, the reflections and
+//!   reverb simulated from the blocks, the sound paths around them, its settings page in Options > Mods, the
+//!   materials and blocks it tunes, and what its visual debug mode shows.
 
 pub mod acoustics;
 pub mod air_absorption;
@@ -33,6 +33,7 @@ pub mod horizon;
 pub mod hrtf;
 pub mod iir;
 pub mod job_graph;
+pub mod materials;
 pub mod math;
 pub mod pathing;
 pub mod paths;

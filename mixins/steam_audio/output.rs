@@ -56,6 +56,22 @@ pub fn settings_click(button: usize, store: &mut dyn FnMut(&str, &str)) {
     steam_audio_hmod::settings::click_and_store(button, store);
 }
 
+/// A key the player pressed (`key.keyboard.a`), for the page's search while it is typed. Returns whether the page's
+/// labels changed: Horizon should ask for them again. For the `key` hook.
+pub fn settings_key(key: &str) -> bool {
+    steam_audio_hmod::settings::key(key)
+}
+
+/// Whether the page's search is being typed.
+pub fn settings_typing() -> bool {
+    steam_audio_hmod::settings::typing()
+}
+
+/// Ends the page's search being typed (the player is back in the game). For the `key` hook.
+pub fn settings_stop_typing() {
+    steam_audio_hmod::settings::stop_typing();
+}
+
 /// Reads the kept settings through `read` (Horizon's `native_setting`), once per game. For the `frame` hook.
 pub fn load_settings(read: &dyn Fn(&str) -> Option<String>) {
     steam_audio_hmod::settings::load(read);
@@ -71,12 +87,14 @@ pub fn update_acoustics(
     audio: &Audio,
     world: &crate::world::World,
     facts: &horizon_items::blocks::BlockFacts,
+    tags: Option<&std::collections::HashMap<String, std::collections::HashSet<String>>>,
 ) {
     use std::cell::RefCell;
     use std::time::{Duration, Instant};
     use std::sync::Arc;
     use steam_audio_hmod::acoustics::{self, Surface};
     use steam_audio_hmod::debug;
+    use steam_audio_hmod::materials;
     use steam_audio_hmod::paths;
     use steam_audio_hmod::reflections::{self, GridBuilder};
 
@@ -125,6 +143,9 @@ pub fn update_acoustics(
         underwater: bool,
         listener: Option<[f64; 3]>,
         facts: usize,
+        // The block tags the catalog was made with (their table, and how many), and the palette the blocks are for.
+        tags: (usize, usize),
+        palette: u64,
         blocks: Vec<Option<Block>>,
         sources: Vec<(u64, [f64; 3], Attenuation)>,
         results: Vec<(u64, acoustics::SourceAcoustics)>,
@@ -154,6 +175,8 @@ pub fn update_acoustics(
                 underwater: false,
                 listener: None,
                 facts: 0,
+                tags: (0, 0),
+                palette: 0,
                 blocks: Vec::new(),
                 sources: Vec::new(),
                 results: Vec::new(),
@@ -174,6 +197,18 @@ pub fn update_acoustics(
                 debugging: false,
             })
         };
+    }
+
+    // The surface a block state gets by itself: a full collision cube of the surface its block and sound type say;
+    // what is not a full cube but counts (liquids, slabs and stairs, doors, leaves, fences and panes:
+    // `Surface::classify_partial`); kelp, seagrass and the like are water to the sound.
+    fn auto_surface(f: &horizon_items::blocks::StateFacts) -> Option<Surface> {
+        let water = f.fluid == horizon_items::blocks::Fluid::Water;
+        if f.full_collision {
+            Some(Surface::classify(&f.name, &f.sounds.break_sound))
+        } else {
+            Surface::classify_partial(&f.name, &f.sounds.break_sound).or(water.then_some(Surface::Water))
+        }
     }
 
     // Forgets the published scene, so that its labels and lines (of a world left, or of a mod turned off) are not
@@ -254,7 +289,37 @@ pub fn update_acoustics(
         // but counts (liquids, slabs and stairs, doors, leaves, fences and panes: `Surface::classify_partial`), with
         // the shape of its state.
         let key = facts as *const horizon_items::blocks::BlockFacts as usize;
-        if state.facts != key || state.blocks.len() != facts.states.len() {
+        let tags_key = tags.map_or((0, 0), |t| (t as *const _ as usize, t.len()));
+        let new_facts = state.facts != key || state.blocks.len() != facts.states.len();
+        // The game's blocks and tags for the settings page's blocks section (and the palette's tuned blocks).
+        if new_facts || state.tags != tags_key {
+            state.tags = tags_key;
+            let mut seen = std::collections::HashSet::new();
+            let blocks: Vec<materials::CatalogBlock> = facts
+                .states
+                .iter()
+                .filter(|f| seen.insert(f.name.to_string()))
+                .map(|f| materials::CatalogBlock {
+                    name: f.name.to_string(),
+                    auto: auto_surface(f),
+                })
+                .collect();
+            let tags = tags
+                .into_iter()
+                .flatten()
+                .map(|(tag, blocks)| (tag.clone(), blocks.iter().cloned().collect::<Vec<String>>()));
+            materials::set_catalog(materials::Catalog::new(blocks, tags));
+        }
+        // The blocks' surfaces as the settings page tunes them: a new palette, every block state is asked again and
+        // the grids are copied anew.
+        let palette = materials::palette();
+        let palette_version = materials::version();
+        if new_facts || state.palette != palette_version {
+            if state.palette != palette_version {
+                state.grid = GridBuilder::new();
+                state.grid_origin = None;
+            }
+            state.palette = palette_version;
             state.facts = key;
             state.blocks.clear();
             state.blocks.resize(facts.states.len(), None);
@@ -267,16 +332,10 @@ pub fn update_acoustics(
             if slot.is_none() {
                 let f = facts.get(id);
                 let water = f.fluid == horizon_items::blocks::Fluid::Water;
-                let surface = if f.full_collision {
-                    Some(Surface::classify(&f.name, &f.sounds.break_sound))
-                } else {
-                    // Kelp, seagrass and the like are water to the sound.
-                    Surface::classify_partial(&f.name, &f.sounds.break_sound)
-                        .or(water.then_some(Surface::Water))
-                };
+                let surface = palette.resolve(&f.name, auto_surface(f));
                 let cube = f.outline.len() == 1 && f.outline[0] == [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
                 let shape = (!f.full_collision
-                    && surface.is_some_and(|s| s.is_solid() && s != Surface::Water)
+                    && surface.is_some_and(|s| s.is_solid() && s.base() != Surface::Water)
                     && !f.outline.is_empty()
                     && !cube)
                     .then(|| f.outline.clone());
@@ -294,7 +353,7 @@ pub fn update_acoustics(
         let underwater = state.underwater
             && block(listener.map(|v| v.floor() as i32)).is_some_and(|b| b.water);
         acoustics::publish_underwater(underwater);
-        let medium = |b: &Block| underwater && b.surface == Some(Surface::Water);
+        let medium = |b: &Block| underwater && b.surface.map(Surface::base) == Some(Surface::Water);
         // For the rays: the surface and the shape.
         let mut wall = |c: [i32; 3]| -> Option<(Surface, Option<acoustics::Shape>)> {
             let b = block(c)?;
