@@ -2,7 +2,7 @@
 
 [English](README.md) · [Русский](README.ru.md)
 
-A native mod (`.hmod`) for [Horizon](https://github.com/horizon-rust/horizon) that replaces Horizon's stereo panning
+A native mod (`.hnmod`) for [Horizon](https://github.com/horizon-rust/horizon) that replaces Horizon's stereo panning
 (a copy of OpenAL Soft) with the **binaural rendering of Steam Audio** from
 [steam-audio-rust](https://github.com/razedproduction/steam-audio-rust), a Rust port of Valve's Steam Audio.
 
